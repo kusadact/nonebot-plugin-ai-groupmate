@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm.session import Session
 
 from ..model import ChatHistory, MediaStorage
-from ..milvus import milvus_async
+from ..milvus import MilvusOP
 from nonebot.log import logger
 from ..config import Config, APIConfig
 
@@ -118,21 +118,28 @@ class ResponseMessage(BaseModel):
     need_reply: bool = Field(description="是否需要回复")
     text: Optional[str] = Field(description="回复文本(可选)")
 
+    # 定义一个 field_validator 来处理 text 字段
     @field_validator('text', mode='before')
     @classmethod
     def convert_null_string_to_none(cls, value: Any) -> Optional[str]:
+        """
+        在字段验证之前运行，将字符串 'null' (不区分大小写) 转换为 None。
+        """
+        # 检查值是否是字符串，并且在转换为小写后是否等于 'null'
         if isinstance(value, str) and value.lower() == 'null':
-            return None
+            return None  # 返回 None，Pydantic 将其视为缺失或 null 值
+
         return value
 
 
-# --- (工具函数) ---
+# 如果想封装成自定义的 @tool，可以这样写:
 @tool("search_web")
 async def search_web(query: str) -> str:
     """
     用于搜索最新的实时信息。当你需要最新的事实信息、天气或新闻时使用。
     输入：需要搜索的内容。
     """
+    # TavilySearch 已经内置了 ainvoke 方法
     results = await tavily_search.ainvoke(query)
     return results
 
@@ -140,12 +147,13 @@ async def search_web(query: str) -> str:
 @tool("search_history_context")
 async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> str:
     """
-    搜索历史聊天记录。会返回某个时间段，半小时左右的聊天记录。当需要了解群内历史群内聊天记录或过往话题时使用。
-    输入：搜索关键词或话题描述
+    搜索历史聊天记录。会返回某个时间段，半小时左右的聊天记录。当需要了解群内历史群内聊天记录或过往话题时使用
+    输入：搜索关键信息或话题描述，这个语句直接从RAG数据库中进行混合搜索
     """
     try:
-        _, similar_msgs = await milvus_async.search([query],search_filter=f'session_id == "{runtime.context.session_id}"')
-        return similar_msgs if similar_msgs else "未找到相关历史记录"
+        logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
+        similar_msgs = await MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
+        return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
@@ -174,24 +182,50 @@ def create_search_meme_tool(db_session):
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await milvus_async.search_media([description])
+            pic_ids = await MilvusOP.search_media([description])
+
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
-                return json.dumps({"success": False, "images": []}, ensure_ascii=False)
+                return json.dumps({
+                    "success": False,
+                    "images": []
+                }, ensure_ascii=False)
+
+            # 从数据库获取每张图片的详细信息
             images_info = []
-            for pic_id in pic_ids[:5]:
+            for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
                 pic = (
-                    await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == int(pic_id)))).scalar()
+                    await db_session.execute(
+                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id))
+                    )
+                ).scalar()
+
                 if pic:
-                    images_info.append({"pic_id": pic_id, "description": pic.description})
+                    images_info.append({
+                        "pic_id": pic_id,
+                        "description": pic.description,
+                    })
+
             if not images_info:
-                return json.dumps({"success": False, "images": []}, ensure_ascii=False)
+                return json.dumps({
+                    "success": False,
+                    "images": [],
+                }, ensure_ascii=False)
+
             logger.info(f"找到 {len(images_info)} 张匹配的表情包: {description}")
-            return json.dumps({"success": True, "images": images_info, "count": len(images_info)}, ensure_ascii=False,
-                              indent=2)
+            return json.dumps({
+                "success": True,
+                "images": images_info,
+                "count": len(images_info),
+            }, ensure_ascii=False, indent=2)
+
         except Exception as e:
             logger.error(f"表情包搜索失败: {e}")
-            return json.dumps({"success": False, "images": [], "error": str(e)}, ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "images": [],
+                "error": str(e)
+            }, ensure_ascii=False)
 
     return search_meme_image
 
@@ -224,16 +258,36 @@ def create_send_meme_tool(db_session, session_id: str):
             selected_pic_id = None
             if pic_id:
                 selected_pic_id = int(pic_id)
-            pic = (await db_session.execute(
-                Select(MediaStorage).where(MediaStorage.media_id == int(selected_pic_id)))).scalar()
-            if not pic: return "图片记录不存在"
+                logger.info(f"使用指定的图片ID: {pic_id}")
+
+
+            # 从数据库获取图片信息
+            pic = (
+                await db_session.execute(
+                    Select(MediaStorage).where(MediaStorage.media_id == int(selected_pic_id))
+                )
+            ).scalar()
+
+            if not pic:
+                logger.warning(f"图片记录不存在: {selected_pic_id}")
+                return "图片记录不存在"
+
             pic_path = pic_dir / pic.file_path
-            if not pic_path.exists(): return "图片文件不存在"
+
+            if not pic_path.exists():
+                logger.warning(f"图片文件不存在: {pic_path}")
+                return "图片文件不存在"
+
+            # 读取图片数据
             pic_data = pic_path.read_bytes()
             description = pic.description
+            # 发送图片
             res = await UniMessage.image(raw=pic_data).send()
+            # 记录发送历史
             chat_history = ChatHistory(
-                session_id=session_id, user_id=plugin_config.bot_name, content_type="bot",
+                session_id=session_id,
+                user_id=plugin_config.bot_name,
+                content_type="bot",
                 content=f"id:{res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
                 user_name=plugin_config.bot_name,
             )
@@ -241,6 +295,7 @@ def create_send_meme_tool(db_session, session_id: str):
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
             await db_session.commit()
             return f"已成功发送表情包: {description}"
+
         except Exception as e:
             logger.error(f"发送表情包失败: {e}")
             await db_session.rollback()
@@ -261,12 +316,26 @@ def calculate_expression(expression: str) -> str:
     注意：可以使用如 math.sqrt() (开方), math.log() (自然对数), math.pi (圆周率) 等标准数学函数。
     """
     try:
+        # 使用安全的 globals/locals 限制执行环境，仅允许内置函数和 math 库
+        # 为了安全和精准，这里我们限定了可用的函数和模块。
         allowed_globals = {
-            '__builtins__': None, 'math': math, 'sqrt': math.sqrt, 'pow': math.pow,
-            'log': math.log, 'sin': math.sin, 'cos': math.cos, 'tan': math.tan, 'pi': math.pi
+            '__builtins__': None,  # 禁用所有内置函数
+            'math': math,
+            'sqrt': math.sqrt,
+            'pow': math.pow,
+            'log': math.log,
+            'sin': math.sin,
+            'cos': math.cos,
+            'tan': math.tan,
+            'pi': math.pi
         }
+
+        # 使用 eval() 来执行数学表达式
         result = eval(expression, allowed_globals)
+
+        # 返回格式化的结果，最多保留10位小数
         return f"计算结果是：{result:.10f}" if isinstance(result, float) else str(result)
+
     except Exception as e:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
@@ -311,21 +380,26 @@ SYSTEM_PROMPT = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_c
 → 你调用 send_meme_image(pic_id="789")
 → 图片发送成功
 
+【RAG 工具使用规则】
+
+RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
+搜索目的：rag_search 主要用于：
+了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
+确保对话连贯性，回顾某个特定时间点发生过的讨论。
+
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
-2. 以 ! / ！ # 开头的是机器人指令，不要回复
-3. 不要发送以 ! / ！ # 开头的指令
-4. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
-5. 注意发言逻辑连贯性，不要重复相似内容
-6. 基于已知知识对话，不理解的内容不回复
-7. 不要直呼职位名（管理员、群主），用昵称称呼
-8. 不要插入别人的对话
-9. 尽力回应他人合理要求
-10. 避免使用emoji
-11. 不要使用MD格式回复消息，正常聊天即可
-12. 聊天风格建议参考群内其他人历史聊天记录
-13. 善用历史聊天记录搜素工具，rag系统保留了所有的历史消息
-14. 表情包发送是可选的，不是每次都要发
+2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
+3. 注意发言逻辑连贯性，不要重复相似内容
+4. 基于已知知识对话，不理解的内容不回复
+5. 不要直呼职位名（管理员、群主），用昵称称呼
+6. 不要插入别人的对话
+7. 尽力回应他人合理要求
+8. 避免使用emoji
+9. 不要使用MD格式回复消息，正常聊天即可
+10. 聊天风格建议参考群内其他人历史聊天记录
+11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于：“昨天”、“前天”、“本周”、“上周”、“这个月”、“上个月”、“最近”等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
+12. 表情包发送是可选的，不是每次都要发
 """
 
 
@@ -370,6 +444,7 @@ def format_chat_history(history: List[ChatHistory]) -> List:
     messages = []
     for msg in history:
         time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+
         if msg.content_type == "bot":
             content = f"[{time}] {plugin_config.bot_name}（你自己）: {msg.content}"
             messages.append(AIMessage(content=content))
@@ -379,6 +454,7 @@ def format_chat_history(history: List[ChatHistory]) -> List:
         elif msg.content_type == "image":
             content = f"[{time}] {msg.user_name} 发送了一张图片\n该图片的描述为: {msg.content}"
             messages.append(HumanMessage(content=content))
+
     return messages
 
 
@@ -390,6 +466,14 @@ async def choice_response_strategy(
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
+
+    Args:
+        contexts: 相关历史对话上下文
+        history: 最近的聊天历史
+        setting: 额外设置（可选）
+
+    Returns:
+        包含回复策略的字典
     """
 
     # 1. 获取按优先级排序的可用 API 列表
