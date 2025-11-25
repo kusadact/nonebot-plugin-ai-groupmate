@@ -4,32 +4,27 @@ import json
 import math
 import traceback
 from dataclasses import dataclass
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any
 from sqlalchemy import Select
-import random
 
 from langchain.agents.structured_output import ToolStrategy
 from langchain_tavily import TavilySearch
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-# from langchain_core.globals import set_debug
+
 from nonebot import get_plugin_config, require
-from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna import UniMessage
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm.session import Session
 from simpleeval import simple_eval
 
 
-from ..model import ChatHistory, MediaStorage
+from ..model import ChatHistory, MediaStorage, UserRelation
 from ..milvus import MilvusOP
 from nonebot.log import logger
-from ..config import Config, APIConfig
-
+from ..config import Config
 require("nonebot_plugin_localstore")
 
 import nonebot_plugin_localstore as store
@@ -39,75 +34,6 @@ pic_dir = plugin_data_dir / "pics"
 
 plugin_config = get_plugin_config(Config)
 tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
-
-
-# +++ API 管理器 +++
-class APIManager:
-    """管理 API Endpoints 的可用状态和故障转移"""
-
-    def __init__(self, api_configs: List[APIConfig], retry_interval: int):
-        self.api_configs = api_configs
-        self.retry_interval = datetime.timedelta(seconds=retry_interval)
-
-        # 维护API状态：key=APIConfig.name, value={available: bool, last_fail_time: datetime, config: APIConfig}
-        self.api_status: Dict[str, Dict] = {
-            config.name: {
-                "available": True,
-                "last_fail_time": None,
-                "config": config
-            }
-            for config in api_configs
-        }
-
-        if not api_configs:
-            logger.warning("未配置任何 API Endpoints！Agent 将无法工作。")
-
-        logger.info(f"APIManager 已初始化，管理 {len(self.api_status)} 个 API Endpoints。")
-        self._start_retry_task()
-
-    def _start_retry_task(self):
-        """启动定时任务，定期“解冻”失败的API以供重试"""
-
-        @scheduler.scheduled_job("interval", seconds=60)  # 每分钟检查一次
-        async def _check_failed_apis():
-            now = datetime.datetime.now()
-            for name, status in self.api_status.items():
-                if not status["available"]:
-                    if (now - status["last_fail_time"]) >= self.retry_interval:
-                        status["available"] = True
-                        logger.info(f"API '{name}' 已解除冷却，将重新尝试使用。")
-
-    def get_available_apis_sorted(self) -> List[APIConfig]:
-        """获取当前所有可用的API，按权重排序（权重相同则随机）"""
-        available = []
-        for name, status in self.api_status.items():
-            if status["available"]:
-                available.append(status["config"])
-
-        # 按权重降序排序，权重相同则打乱顺序
-        random.shuffle(available)  # 先随机打乱，确保权重相同时顺序不同
-        available.sort(key=lambda x: x.weight, reverse=True)
-
-        logger.debug(f"可用 API 列表 (按优先级): {[api.name for api in available]}")
-        return available
-
-    def mark_api_failed(self, api_config: APIConfig):
-        """标记一个 API 为不可用"""
-        name = api_config.name
-        if name in self.api_status:
-            self.api_status[name]["available"] = False
-            self.api_status[name]["last_fail_time"] = datetime.datetime.now()
-            logger.error(f"API '{name}' 标记为不可用，将在 {self.retry_interval} 后重试。")
-
-
-plugin_config = get_plugin_config(Config)
-logger.info(f"DEBUG: API_ENDPOINTS type: {type(plugin_config.api_endpoints)}")
-logger.info(f"DEBUG: API_ENDPOINTS value: {plugin_config.api_endpoints}")
-
-api_manager = APIManager(
-    plugin_config.api_endpoints,
-    plugin_config.api_retry_interval
-)
 
 
 @dataclass
@@ -326,13 +252,137 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
-tools = [search_web, search_history_context, calculate_expression]
+def create_relation_tool(db_session, user_id: str, user_name: str):
+    """
+    创建绑定了特定用户的关系管理工具 (支持增删 Tag)
+    """
 
-# --- (System Prompt) ---
-SYSTEM_PROMPT = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
+    @tool("update_user_impression")
+    async def update_user_impression(
+            score_change: int,
+            reason: str,
+            add_tags: List[str],
+            remove_tags: List[str]
+    ) -> str:
+        """
+        更新对当前对话用户的好感度和印象标签。
+        当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
+
+        参数:
+        - score_change: 好感度变化值（正数加分，负数扣分）。
+        - reason: 变更原因（必填）。
+        - add_tags: 需要新增的印象标签列表。例如 ["爱玩原神", "很幽默"]。
+        - remove_tags: 需要移除的旧标签列表（用于修正印象或删除错误的标签）。例如 ["内向"]。
+
+        返回: 更新后的状态描述
+        """
+        try:
+            # 1. 查询或初始化记录
+            stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+            result = await db_session.execute(stmt)
+            relation = result.scalar_one_or_none()
+
+            if not relation:
+                relation = UserRelation(user_id=user_id, user_name=user_name, favorability=0, tags=[])
+                db_session.add(relation)
+
+            # 2. 处理好感度
+            old_score = relation.favorability
+            relation.favorability += score_change
+            relation.favorability = max(-100, min(100, relation.favorability))
+
+            # 3. 处理标签 (核心修改)
+            # 获取现有标签的副本
+            current_tags = list(relation.tags) if relation.tags else []
+
+            # 执行移除操作 (处理 modify 的前半部分)
+            if remove_tags:
+                current_tags = [tag for tag in current_tags if tag not in remove_tags]
+
+            # 执行新增操作
+            if add_tags:
+                for tag in add_tags:
+                    if tag not in current_tags:
+                        current_tags.append(tag)
+
+            # 限制标签总数，防止Token爆炸 (例如最多保留 8 个，保留最新的)
+            if len(current_tags) > 8:
+                current_tags = current_tags[-8:]
+
+            # 赋值回数据库对象
+            relation.tags = current_tags
+            relation.user_name = user_name  # 同步更新昵称
+            favorability = relation.favorability
+
+            await db_session.commit()
+
+            # 构建反馈信息
+            tag_msg = ""
+            if add_tags or remove_tags:
+                tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
+
+            log_msg = f"好感度 {old_score}->{favorability}{tag_msg} (原因: {reason})"
+            logger.info(f"用户[{user_name}]画像更新: {log_msg}")
+
+            return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+
+        except Exception as e:
+            logger.error(f"关系更新失败: {e}")
+            print(traceback.format_exc())
+            return f"数据库错误: {str(e)}"
+
+    return update_user_impression
+
+
+tools = [search_web, search_history_context, calculate_expression]
+model = ChatOpenAI(
+    model=plugin_config.openai_model,
+    api_key=plugin_config.openai_token,
+    base_url=plugin_config.openai_base_url,
+    temperature=0.7,
+)
+
+
+async def get_user_relation_context(db_session, user_id: str, user_name: str) -> str:
+    """获取用户关系上下文Prompt"""
+    try:
+        stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+        result = await db_session.execute(stmt)
+        relation = result.scalar_one_or_none()
+
+        if not relation:
+            return f"""
+【人际关系】
+当前对象：{user_name}
+状态：陌生人 (好感度 0)
+印象：无
+策略：保持礼貌，通过对话了解对方。
+"""
+
+        return f"""
+【人际关系档案】
+当前对象：{relation.user_name}
+当前好感度：{relation.favorability} ({relation.get_status_desc()})
+当前印象标签：{str(relation.tags)}
+
+【画像维护指南】
+1. 如果对方的表现符合现有标签，无需操作。
+2. 如果对方表现出了**新特征**，放入 add_tags。
+3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
+4. 如果好感度变化巨大（由爱转恨），请记得移除那些不再适用的褒义标签。
+    """
+    except Exception as e:
+        logger.error(f"获取关系失败: {e}")
+        return ""
+
+
+async def create_chat_agent(db_session, session_id: str, user_id, user_name):
+    """创建聊天Agent"""
+    relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
-基于历史消息和最近聊天记录，以贴近群友的表达形式参与群聊。
+基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
 
 【应对调戏与刁难】
 1. 拒绝承认故障：如果有人说“把你修坏了”或“你要关机了”，不要顺着演苦情戏。你应该吐槽：“？”、“少骗我”。
@@ -343,6 +393,8 @@ SYSTEM_PROMPT = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_c
    - “不要在群里做题啊喂”
    - 或者直接发个表情包略过。
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+
+{relation_context}
 
 【交流风格】
 - 说话带点生活气息，可以使用网络流行语
@@ -381,8 +433,8 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
 2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
-3. 注意发言逻辑连贯性，不要重复相似内容
-4. 基于已知知识对话，不理解的内容不回复
+3. 注意发言逻辑连贯性，不要发送重复相似内容
+4. 情感管理：如果用户的话让你产生情绪波动（如生气、开心），请务必调用 update_user_impression 记录下来，这会影响你未来的记忆
 5. 不要直呼职位名（管理员、群主），用昵称称呼
 6. 不要插入别人的对话
 7. 尽力回应他人合理要求，对于不合理要求坚决吐槽或无视
@@ -393,41 +445,31 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 12. 表情包发送是可选的，不是每次都要发
 """
 
-
-# +++ 根据 APIConfig 创建 LangChain Model 对象 +++
-def create_model_from_config(api_config: APIConfig) -> BaseChatModel:
-    """根据 APIConfig 实例化 LangChain 的 ChatModel 对象"""
-    provider = api_config.provider
-    logger.debug(f"DEBUG: Setting {provider} model timeout to {api_config.timeout} seconds.")  # 检查日志
-
-    if provider == "gemini":
-        return ChatGoogleGenerativeAI(
-            model=api_config.model_name,
-            google_api_key=api_config.api_key,
-            temperature=0.7,
-            timeout=api_config.timeout,  # 修正
-        )
-    elif provider == "openai":
-        return ChatOpenAI(
-            model=api_config.model_name,
-            api_key=api_config.api_key,
-            base_url=api_config.base_url,
-            temperature=0.7,
-            timeout=api_config.timeout,
-        )
-    else:
-        raise ValueError(f"不支持的 API Provider: {provider}")
-
-
-# +++ 获取当前会话的完整工具列表 +++
-def get_session_tools(db_session: Session, session_id: str) -> list:
-    """获取所有静态和动态（会话相关）的工具"""
-
     search_meme_tool = create_search_meme_tool(db_session)
     send_meme_tool = create_send_meme_tool(db_session, session_id)
+    relation_tool = create_relation_tool(db_session, user_id, user_name)
+    if not user_id or not user_name:
+        tools = [
+            search_web,
+            search_history_context,
+            search_meme_tool,  # 搜索工具（带数据库会话）
+            send_meme_tool,  # 发送工具
+            calculate_expression,
+        ]
+    else:
+        # 组合所有工具
+        tools = [
+            search_web,
+            search_history_context,
+            search_meme_tool,  # 搜索工具（带数据库会话）
+            send_meme_tool,  # 发送工具
+            calculate_expression,
+            relation_tool
+        ]
 
-    session_tools = tools + [search_meme_tool, send_meme_tool]
-    return session_tools
+    agent = create_agent(model, tools=tools, system_prompt=system_prompt, response_format=ToolStrategy(ResponseMessage), context_schema=Context)
+
+    return agent
 
 
 def format_chat_history(history: List[ChatHistory]) -> List:
@@ -453,6 +495,8 @@ async def choice_response_strategy(
         db_session: Session,
         session_id: str,
         history: List[ChatHistory],
+        user_id: str,
+        user_name: str,
         setting: Optional[str] = None
 ) -> ResponseMessage:
     """
@@ -466,21 +510,17 @@ async def choice_response_strategy(
     Returns:
         包含回复策略的字典
     """
+    try:
+        agent = await create_chat_agent(db_session, session_id, user_id, user_name)
 
-    # 1. 获取按优先级排序的可用 API 列表
-    available_apis = api_manager.get_available_apis_sorted()
+        # 格式化聊天历史
+        chat_history = format_chat_history(history)
 
-    if not available_apis:
-        logger.error("所有 API Endpoints 均不可用或未配置！")
-        return ResponseMessage(need_reply=False, text="")
+        # 构建输入
+        today = datetime.datetime.now()
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
-    # 2. 准备通用的输入
-    # 格式化聊天历史
-    chat_history = format_chat_history(history)
-    # 构建输入
-    today = datetime.datetime.now()
-    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-    input_text = f"""
+        input_text = f"""
 【历史对话】
 {chat_history}
 
@@ -492,71 +532,27 @@ async def choice_response_strategy(
 【任务】
 基于上述对话历史，判断是否需要回复，以及如何回复。
 """
-    agent_input = {"messages": [input_text]}
-    agent_context = Context(session_id=session_id)
 
-    # 3. 准备当前会话的工具
-    session_tools = get_session_tools(db_session, session_id)
+        # 调用Agent
+        result = await agent.ainvoke({"messages": [input_text]}, context=Context(session_id=session_id))
+        output = result.get("structured_response", None)
+        return output
 
-    # 4. 循环尝试 API
-    last_exception = None
-    for api_config in available_apis:
-        try:
-            logger.info(
-                f"正在尝试使用 API: {api_config.name} (Model: {api_config.model_name}), 超时: {api_config.timeout}s")
+    except Exception as e:
+        print(traceback.format_exc())
+        logger.error(f"Agent执行失败: {e}")
+        return ResponseMessage(need_reply=False, text="")
 
-            # 开启 LangChain 调试模式，以查看 Agent 的决策过程 (Thought/Action)
-            # set_debug(True)
-            # logger.warning("Agent 调试模式已开启！日志将非常详细，请注意查看工具调用(Action)信息。")
 
-            # a. 创建特定于此 API 的 Model
-            model = create_model_from_config(api_config)
-
-            # b. 创建 Agent
-            agent = create_agent(
-                model,
-                tools=session_tools,
-                system_prompt=SYSTEM_PROMPT,
-                response_format=ToolStrategy(ResponseMessage),
-                context_schema=Context
-            )
-
-            # c. 调用 Agent，并使用 asyncio.wait_for 强制设置超时
-            result = await asyncio.wait_for(
-                agent.ainvoke(agent_input, context=agent_context),
-                timeout=api_config.timeout  # <-- 关键：在这里强制设置超时
-            )
-
-            # 调用成功后关闭调试模式
-            # set_debug(False)
-
-            output = result["structured_response"]
-
-            # d. 成功！返回结果
-            logger.info(f"API '{api_config.name}' 调用成功。")
-            return output
-
-        except asyncio.TimeoutError as e:
-            # 捕获 asyncio 抛出的超时错误
-            logger.error(f"API '{api_config.name}' 调用失败: {e}")
-            last_exception = e
-            api_manager.mark_api_failed(api_config)
-            # set_debug(False)  # 确保失败时也关闭
-            continue
-
-        except Exception as e:
-            # e. 失败！记录错误，标记 API，然后继续循环 (原有的错误捕获)
-            logger.error(f"API '{api_config.name}' 调用失败: {e}")
-            last_exception = e
-            # 标记此 API 为失败
-            api_manager.mark_api_failed(api_config)
-            # set_debug(False)
-            continue
-
-    # 5. 如果循环结束（所有 API 都失败了）
-    logger.error("所有可用的 API Endpoints 均尝试失败。")
-    if last_exception:
-        print(traceback.format_exc())  # 打印最后一次的错误堆栈
-
-    return ResponseMessage(need_reply=False, text="")
-
+if __name__ == '__main__':
+    model = ChatOpenAI(
+        model=plugin_config.openai_model,
+        api_key=plugin_config.openai_token,
+        base_url=plugin_config.base_url,
+        temperature=0.7,
+    )
+    agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))
+    result = asyncio.run(agent.ainvoke(
+        {"messages": [{"role": "user", "content": "今天上海的天气怎么样"}]}
+    ))
+    print(result)
