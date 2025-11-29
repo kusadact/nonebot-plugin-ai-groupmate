@@ -10,7 +10,10 @@ from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
+# 导入模型库
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+
 from langchain_tavily import TavilySearch
 from nonebot import get_plugin_config, require
 from nonebot.log import logger
@@ -31,10 +34,18 @@ import nonebot_plugin_localstore as store
 plugin_data_dir = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 plugin_path = Path(__file__).parent
-with open(plugin_path / "上升.jpg", "rb") as f:
-    up_pic = f.read()
-with open(plugin_path / "下降.jpg", "rb") as f:
-    down_pic = f.read()
+
+# 读取资源图片
+try:
+    with open(plugin_path / "上升.jpg", "rb") as f:
+        up_pic = f.read()
+    with open(plugin_path / "下降.jpg", "rb") as f:
+        down_pic = f.read()
+except FileNotFoundError:
+    logger.warning("未找到 上升.jpg 或 下降.jpg，好感度图片功能将失效")
+    up_pic = None
+    down_pic = None
+
 plugin_config = get_plugin_config(Config)
 
 if plugin_config.tavily_api_key:
@@ -53,7 +64,6 @@ class ResponseMessage(BaseModel):
     need_reply: bool = Field(description="是否需要回复")
     text: str | None = Field(description="回复文本(可选)")
 
-    # 定义一个 field_validator 来处理 text 字段
     @field_validator("text", mode="before")
     @classmethod
     def convert_null_string_to_none(cls, value: Any) -> str | None:
@@ -62,12 +72,10 @@ class ResponseMessage(BaseModel):
         """
         # 检查值是否是字符串，并且在转换为小写后是否等于 'null'
         if isinstance(value, str) and value.lower() == "null":
-            return None  # 返回 None，Pydantic 将其视为缺失或 null 值
-
+            return None
         return value
 
 
-# 如果想封装成自定义的 @tool，可以这样写:
 @tool("search_web")
 async def search_web(query: str) -> str:
     """
@@ -347,13 +355,44 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
     return update_user_impression
 
 
-tools = [search_web, search_history_context, calculate_expression]
-model = ChatOpenAI(
-    model=plugin_config.openai_model,
-    api_key=SecretStr(plugin_config.openai_token),
-    base_url=plugin_config.openai_base_url,
-    temperature=0.7,
-)
+# === 模型工厂函数 ===
+def get_chat_model():
+    """根据配置返回 LLM 模型实例"""
+    provider = getattr(plugin_config, "llm_provider", "openai")
+
+    if provider == "gemini":
+        gemini_key = getattr(plugin_config, "gemini_api_key", "")
+        if not gemini_key:
+            logger.error("配置了 Gemini 但未提供 gemini_api_key")
+
+        # 宽容的安全设置，防止拒答
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        logger.info(f"使用 Gemini 模型: {getattr(plugin_config, 'gemini_model', 'gemini-1.5-flash')}")
+        return ChatGoogleGenerativeAI(
+            model=getattr(plugin_config, "gemini_model", "gemini-2.5-flash"),
+            google_api_key=SecretStr(gemini_key),
+            temperature=0.7,
+            safety_settings=safety_settings,
+        )
+    else:
+        # OpenAI 默认配置
+        logger.info(f"使用 OpenAI 模型: {plugin_config.openai_model}")
+        return ChatOpenAI(
+            model=plugin_config.openai_model,
+            api_key=SecretStr(plugin_config.openai_token),
+            base_url=plugin_config.openai_base_url,
+            temperature=0.7,
+        )
+
+
+# 初始化模型
+model = get_chat_model()
 
 
 async def get_user_relation_context(db_session, user_id: str, user_name: str | None) -> str:
@@ -550,39 +589,20 @@ async def choice_response_strategy(
 
         raw_output = result.get("structured_response")
 
-        # 情况 A: 如果 Agent 没返回 structured_response (为 None)
         if raw_output is None:
             logger.warning(f"Agent session {session_id} 未返回有效结构化数据")
-            # 返回一个默认的安全对象，防止报错
             return ResponseMessage(need_reply=False, text=None)
 
-        # 情况 B: 如果 Agent 返回的是字典 (Dict)，需要转为 Pydantic 模型
         if isinstance(raw_output, dict):
             return ResponseMessage.model_validate(raw_output)
 
-        # 情况 C: 如果 Agent 直接返回了 ResponseMessage 对象 (某些高级Agent框架会这样)
         if isinstance(raw_output, ResponseMessage):
             return raw_output
 
-        # 兜底：虽然有值但类型不对
         logger.error(f"Agent 返回类型未知: {type(raw_output)}")
         return ResponseMessage(need_reply=False, text=None)
 
     except Exception:
         logger.exception("Agent 决策过程发生异常")
-        # 发生异常时也需要返回一个符合类型签名的对象
         return ResponseMessage(need_reply=False, text=None)
 
-
-if __name__ == "__main__":
-    model = ChatOpenAI(
-        model=plugin_config.openai_model,
-        api_key=SecretStr(plugin_config.openai_token),
-        base_url=plugin_config.openai_base_url,
-        temperature=0.7,
-    )
-    agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))
-    result = asyncio.run(agent.ainvoke(
-        {"messages": [{"role": "user", "content": "今天上海的天气怎么样"}]}
-    ))
-    print(result)
