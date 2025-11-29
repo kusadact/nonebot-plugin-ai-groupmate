@@ -1,22 +1,19 @@
 import asyncio
 import base64
-import hashlib
-import traceback
 from datetime import timedelta
-from typing import List, Optional, Dict, Tuple
-
-from PIL import Image
+import hashlib
 import io
+import traceback
 
+from nonebot import get_plugin_config, logger
 from nonebot_plugin_orm import AsyncSession
+from PIL import Image
 from sqlalchemy import Select, Update
-
-from nonebot import logger, get_plugin_config
 from tqdm import tqdm
 
-from .model import ChatHistory, ChatHistorySchema
-from .milvus import MilvusOP
 from .config import Config
+from .milvus import MilvusOP
+from .model import ChatHistory, ChatHistorySchema
 
 plugin_config = get_plugin_config(Config)
 
@@ -61,6 +58,7 @@ def check_and_compress_image_bytes(
         # 尝试不同的质量等级直到文件大小小于目标大小
         quality = quality_start
         compressed_image = io.BytesIO()
+        compressed_size = compressed_image.tell()
 
         while quality > 10:
             compressed_image.seek(0)
@@ -71,7 +69,6 @@ def check_and_compress_image_bytes(
                 compressed_image, format=image_format, quality=quality, optimize=True
             )
 
-            compressed_size = compressed_image.tell()
 
             if compressed_size <= max_size_bytes:
                 break
@@ -87,7 +84,7 @@ def check_and_compress_image_bytes(
             new_width = int(width * ratio * 0.9)  # 稍微减小一点以确保大小达标
             new_height = int(height * ratio * 0.9)
 
-            img = img.resize((new_width, new_height), Image.LANCZOS)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             compressed_image.seek(0)
             compressed_image.truncate(0)
@@ -129,7 +126,7 @@ async def split_chat_into_context_groups(
         max_time_gap: timedelta = timedelta(hours=1),
         max_token_count: int = 700,
         max_messages: int = 50,
-) -> List[List[ChatHistory]]:
+) -> list[list[ChatHistory]]:
     """
     将一个会话内的聊天记录智能切分为多个上下文组
 
@@ -226,7 +223,7 @@ async def process_and_vectorize_session_chats(
         max_token_count: int = 1000,
         chunk_size: int = 100,
         commit_interval: int = 500,
-) -> Optional[Dict]:
+) -> dict | None:
     """
     处理并向量化一个会话内的聊天记录，按上下文智能切分
 
@@ -313,7 +310,7 @@ async def process_and_vectorize_session_chats(
 
 def combine_messages_into_context(
         messages: list[ChatHistory]
-) -> Tuple[str, List[str]]:
+) -> tuple[str, list[int]]:
     context_parts = []
     msg_ids = []
 
@@ -335,7 +332,7 @@ def combine_messages_into_context(
 
 
 async def insert_vectors_with_retry(
-        contexts: List[str],
+        contexts: list[str],
         session_id: str,
         max_retries: int = 3
 ) -> None:
@@ -357,7 +354,7 @@ async def insert_vectors_with_retry(
 
 async def update_messages_in_batches(
         db_session: AsyncSession,
-        msg_ids: List[str],
+        msg_ids: list[int],
         batch_size: int = 500
 ) -> None:
     """
@@ -382,7 +379,7 @@ async def update_messages_in_batches(
 
 async def update_messages_one_by_one(
         db_session: AsyncSession,
-        msg_ids: List[str]
+        msg_ids: list[int]
 ) -> None:
     """
     逐条更新（降级方案）

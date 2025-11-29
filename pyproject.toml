@@ -1,32 +1,35 @@
 [project]
 name = "nonebot-plugin-ai-groupmate"
-version = "0.2.1"
-description = "miyuki"
+version = "1.0.1"
+description = "ai 群友"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.14"
+authors = [
+    {name = "yaowan233", email = "572473053@qq.com"},
+]
 dependencies = [
     "datasets>=3.4.1",
     "einops>=0.8.1",
     "expiringdict>=1.2.2",
-    "flagembedding>=1.3.4",
+    "flagembedding>=1.3.5",
     "jieba>=0.42.1",
-    "langchain>=1.0.4",
-    "langchain-openai>=1.0.2",
+    "langchain>=1.1.0",
+    "langchain-openai>=1.0.3",
     "langchain-tavily>=0.2.13",
     "matplotlib>=3.10.1",
-    "nb-cli>=1.4.2",
-    "nonebot-adapter-onebot>=2.4.6",
-    "nonebot-plugin-alconna>=0.56.2",
+    "nonebot-plugin-alconna>=0.60.3",
     "nonebot-plugin-apscheduler>=0.5.0",
     "nonebot-plugin-localstore>=0.7.4",
-    "nonebot-plugin-orm>=0.7.7",
+    "nonebot-plugin-orm>=0.8.2",
     "nonebot-plugin-session>=0.3.2",
-    "nonebot-plugin-uninfo>=0.7.0",
-    "nonebot2>=2.4.2",
+    "nonebot-plugin-uninfo>=0.10.0",
+    "nonebot2>=2.4.4",
     "numpy>=2",
+    "ollama>=0.6.1",
     "peft>=0.15.0",
     "pillow>=11.1.0",
-    "pymilvus[model]>=2.5.6",
+    "pymilvus[milvus-lite,model]>=2.6.3",
+    "simpleeval>=1.0.3",
     "timm>=1.0.22",
     "torch>=2.7.0",
     "torchaudio>=2.7.0",
@@ -34,7 +37,80 @@ dependencies = [
     "wordcloud>=1.9.4",
 ]
 
+[dependency-groups]
+dev = [
+  "bump-my-version>=1.2.4",
+  "nonebot2[fastapi]>=2.4.4,<3.0.0",
+  "poethepoet>=0.36.0",
+  "ruff>=0.14.5,<1.0.0",
+]
+test = [
+  "nb-cli>=1.5.0",
+  "nonebot-adapter-onebot>=2.4.6,<3.0.0",
+  "nonebot-plugin-orm[default]>=0.8.2",
+  "nonebot2[fastapi]>=2.4.4,<3.0.0",
+  "nonebug>=0.3.7,<1.0.0",
+  "poethepoet>=0.36.0",
+  "pytest-asyncio>=1.3.0,<1.4.0",
+  "pytest-cov>=7.0.0",
+  "pytest-xdist>=3.8.0,<4.0.0",
+]
+
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 300
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "UP", "C", "T", "PYI", "PT", "Q", "I"]
+ignore = ["C901", "T201", "E731", "E402"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+
+[tool.nonebot]
+adapters = []
+plugins = ["nonebot_plugin_ai_groupmate"]
+
+[tool.poe.tasks]
+test = "pytest --cov=src --cov-report xml --junitxml=./junit.xml -n auto"
+bump = "bump-my-version bump"
+show-bump = "bump-my-version show-bump"
+
+[tool.pyright]
+pythonVersion = "3.10"
+pythonPlatform = "All"
+defineConstant = { PYDANTIC_V2 = true }
+executionEnvironments = [
+  { root = "./tests", extraPaths = [
+    "./src",
+  ] },
+  { root = "./src" },
+]
+typeCheckingMode = "standard"
+disableBytesTypePromotions = true
+
+[tool.pytest.ini_options]
+addopts = [
+  "-v",  # 详细输出
+  "-s",  # 显示打印信息
+  "--tb=short",  # 简短的错误回溯
+  "-ra",  # 显示所有测试结果摘要
+  "--strict-markers",  # 严格标记模式
+  "--import-mode=prepend",  # 导入模式
+]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
 
 [project.urls]
 Homepage = "https://github.com/yaowan233/nonebot-plugin-ai-groupmate"
 Repository = "https://github.com/yaowan233/nonebot-plugin-ai-groupmate"
+
+[tool.uv]
+required-version = ">=0.9.0"
+default-groups = ["test", "dev"]

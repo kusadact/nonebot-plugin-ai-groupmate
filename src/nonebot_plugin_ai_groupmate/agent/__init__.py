@@ -1,39 +1,46 @@
 import asyncio
+from dataclasses import dataclass
 import datetime
 import json
-import math
+from pathlib import Path
 import traceback
-from dataclasses import dataclass
-from typing import List, Optional, Any
-from sqlalchemy import Select
+from typing import Any, cast
 
-from langchain.agents.structured_output import ToolStrategy
-from langchain_tavily import TavilySearch
-from langchain.tools import tool, ToolRuntime
-from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, AIMessage
-
+from langchain.agents.structured_output import ToolStrategy
+from langchain.tools import ToolRuntime, tool
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_tavily import TavilySearch
 from nonebot import get_plugin_config, require
-from nonebot_plugin_alconna import UniMessage
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy.orm.session import Session
-from simpleeval import simple_eval
-
-
-from ..model import ChatHistory, MediaStorage, UserRelation
-from ..milvus import MilvusOP
 from nonebot.log import logger
+from nonebot_plugin_alconna import UniMessage
+from pydantic import BaseModel, Field, SecretStr, field_validator
+from simpleeval import simple_eval
+from sqlalchemy import Select
+from sqlalchemy.orm.session import Session
+
 from ..config import Config
+from ..milvus import MilvusOP
+from ..model import ChatHistory, ChatHistorySchema, MediaStorage, UserRelation
+
 require("nonebot_plugin_localstore")
 
 import nonebot_plugin_localstore as store
 
 plugin_data_dir = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
-
+plugin_path = Path(__file__).parent
+with open(plugin_path / "上升.jpg", "rb") as f:
+    up_pic = f.read()
+with open(plugin_path / "下降.jpg", "rb") as f:
+    down_pic = f.read()
 plugin_config = get_plugin_config(Config)
-tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
+
+if plugin_config.tavily_api_key:
+    tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
+else:
+    tavily_search = None
 
 
 @dataclass
@@ -44,17 +51,17 @@ class Context:
 class ResponseMessage(BaseModel):
     """模型回复内容"""
     need_reply: bool = Field(description="是否需要回复")
-    text: Optional[str] = Field(description="回复文本(可选)")
+    text: str | None = Field(description="回复文本(可选)")
 
     # 定义一个 field_validator 来处理 text 字段
-    @field_validator('text', mode='before')
+    @field_validator("text", mode="before")
     @classmethod
-    def convert_null_string_to_none(cls, value: Any) -> Optional[str]:
+    def convert_null_string_to_none(cls, value: Any) -> str | None:
         """
         在字段验证之前运行，将字符串 'null' (不区分大小写) 转换为 None。
         """
         # 检查值是否是字符串，并且在转换为小写后是否等于 'null'
-        if isinstance(value, str) and value.lower() == 'null':
+        if isinstance(value, str) and value.lower() == "null":
             return None  # 返回 None，Pydantic 将其视为缺失或 null 值
 
         return value
@@ -67,7 +74,9 @@ async def search_web(query: str) -> str:
     用于搜索最新的实时信息。当你需要最新的事实信息、天气或新闻时使用。
     输入：需要搜索的内容。
     """
-    # TavilySearch 已经内置了 ainvoke 方法
+    if not tavily_search:
+        logger.error("没有配置 tavily_api_key, 无法进行搜索")
+        return "没有配置 tavily_api_key, 无法进行搜索"
     results = await tavily_search.ainvoke(query)
     return results
 
@@ -171,7 +180,7 @@ def create_send_meme_tool(db_session, session_id: str):
     """
 
     @tool("send_meme_image")
-    async def send_meme_image(pic_id: Optional[str] = None) -> str:
+    async def send_meme_image(pic_id: str | None = None) -> str:
         """
         发送表情包图片到聊天中。
 
@@ -187,7 +196,8 @@ def create_send_meme_tool(db_session, session_id: str):
             if pic_id:
                 selected_pic_id = int(pic_id)
                 logger.info(f"使用指定的图片ID: {pic_id}")
-
+            if not selected_pic_id:
+                return "没有指定图片id"
 
             # 从数据库获取图片信息
             pic = (
@@ -214,10 +224,10 @@ def create_send_meme_tool(db_session, session_id: str):
             # 记录发送历史
             chat_history = ChatHistory(
                 session_id=session_id,
-                user_id=plugin_config.bot_name,
+                user_id=plugin_config.ai_bot_name,
                 content_type="bot",
                 content=f"id:{res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
-                user_name=plugin_config.bot_name,
+                user_name=plugin_config.ai_bot_name,
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
@@ -252,7 +262,7 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
-def create_relation_tool(db_session, user_id: str, user_name: str):
+def create_relation_tool(db_session, user_id: str, user_name: str | None):
     """
     创建绑定了特定用户的关系管理工具 (支持增删 Tag)
     """
@@ -261,8 +271,8 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
     async def update_user_impression(
             score_change: int,
             reason: str,
-            add_tags: List[str],
-            remove_tags: List[str]
+            add_tags: list[str],
+            remove_tags: list[str]
     ) -> str:
         """
         更新对当前对话用户的好感度和印象标签。
@@ -283,14 +293,17 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
             relation = result.scalar_one_or_none()
 
             if not relation:
-                relation = UserRelation(user_id=user_id, user_name=user_name, favorability=0, tags=[])
+                relation = UserRelation(user_id=user_id, user_name=user_name or "", favorability=0, tags=[])
                 db_session.add(relation)
 
             # 2. 处理好感度
             old_score = relation.favorability
             relation.favorability += score_change
             relation.favorability = max(-100, min(100, relation.favorability))
-
+            if score_change > 0:
+                await UniMessage.image(raw=up_pic).send()
+            elif score_change < 0:
+                await UniMessage.image(raw=down_pic).send()
             # 3. 处理标签 (核心修改)
             # 获取现有标签的副本
             current_tags = list(relation.tags) if relation.tags else []
@@ -311,7 +324,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
 
             # 赋值回数据库对象
             relation.tags = current_tags
-            relation.user_name = user_name  # 同步更新昵称
+            relation.user_name = user_name or ""  # 同步更新昵称
             favorability = relation.favorability
 
             await db_session.commit()
@@ -337,13 +350,13 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
 tools = [search_web, search_history_context, calculate_expression]
 model = ChatOpenAI(
     model=plugin_config.openai_model,
-    api_key=plugin_config.openai_token,
+    api_key=SecretStr(plugin_config.openai_token),
     base_url=plugin_config.openai_base_url,
     temperature=0.7,
 )
 
 
-async def get_user_relation_context(db_session, user_id: str, user_name: str) -> str:
+async def get_user_relation_context(db_session, user_id: str, user_name: str | None) -> str:
     """获取用户关系上下文Prompt"""
     try:
         stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
@@ -370,16 +383,16 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str) ->
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
 4. 如果好感度变化巨大（由爱转恨），请记得移除那些不再适用的褒义标签。
-    """
+"""
     except Exception as e:
         logger.error(f"获取关系失败: {e}")
         return ""
 
 
-async def create_chat_agent(db_session, session_id: str, user_id, user_name):
+async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
-    system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
+    system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.ai_bot_name}"。
 
 【核心任务】
 基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
@@ -405,16 +418,21 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name):
 - 不要强调自己是人类或群友，也不要承认自己是AI
 - 友善对待他人，不要随便生气，表现可爱一点
 
+【联网搜索工具】
+当有不理解的内容或者缩写或者专业词汇，首先使用联网搜索工具搜索相关内容
+
 【表情包使用流程】
 1. 当你觉得需要发表情包时，先用 search_meme_image 搜索
 2. 仔细查看返回的图片描述列表，判断哪张图片最合适当前场景
 3. 选择合适的图片，使用 send_meme_image 发送（通过pic_id指定）
 4. 你可以选择只发图片，或者图片+文字一起回复
 5. 如果所有搜索结果都不合适，可以选择不发图片
+6. 可以搜索小女孩或者动漫相关表情包来丰富表情包类型
+7. 不要一直发自己发过的表情包
 
 示例流程：
 用户："太好笑了"
-→ 你调用 search_meme_image("笑") 
+→ 你调用 search_meme_image("笑") 或 search_meme_image("小女孩，笑") 或 search_meme_image("动漫风，笑")
 → 返回：
   - pic_id: 123, 描述: "一只猫咪笑得眯起眼睛"
   - pic_id: 456, 描述: "熊猫捂嘴偷笑"
@@ -432,7 +450,7 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
-2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
+2. 不要自称AI、机器人或助手，你就是{plugin_config.ai_bot_name}
 3. 注意发言逻辑连贯性，不要发送重复相似内容
 4. 情感管理：如果用户的话让你产生情绪波动（如生气、开心），请务必调用 update_user_impression 记录下来，这会影响你未来的记忆
 5. 不要直呼职位名（管理员、群主），用昵称称呼
@@ -467,19 +485,20 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             relation_tool
         ]
 
-    agent = create_agent(model, tools=tools, system_prompt=system_prompt, response_format=ToolStrategy(ResponseMessage), context_schema=Context)
+    agent = create_agent(model, tools=tools, system_prompt=system_prompt,
+                         response_format=ToolStrategy(ResponseMessage), context_schema=Context)
 
     return agent
 
 
-def format_chat_history(history: List[ChatHistory]) -> List:
+def format_chat_history(history: list[ChatHistorySchema]) -> list:
     """将聊天历史格式化为LangChain消息格式"""
     messages = []
     for msg in history:
         time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
 
         if msg.content_type == "bot":
-            content = f"[{time}] {plugin_config.bot_name}（你自己）: {msg.content}"
+            content = f"[{time}] {plugin_config.ai_bot_name}（你自己）: {msg.content}"
             messages.append(AIMessage(content=content))
         elif msg.content_type == "text":
             content = f"[{time}] {msg.user_name}: {msg.content}"
@@ -494,21 +513,13 @@ def format_chat_history(history: List[ChatHistory]) -> List:
 async def choice_response_strategy(
         db_session: Session,
         session_id: str,
-        history: List[ChatHistory],
+        history: list[ChatHistorySchema],
         user_id: str,
-        user_name: str,
-        setting: Optional[str] = None
+        user_name: str | None,
+        setting: str | None = None
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
-
-    Args:
-        contexts: 相关历史对话上下文
-        history: 最近的聊天历史
-        setting: 额外设置（可选）
-
-    Returns:
-        包含回复策略的字典
     """
     try:
         agent = await create_chat_agent(db_session, session_id, user_id, user_name)
@@ -533,22 +544,41 @@ async def choice_response_strategy(
 基于上述对话历史，判断是否需要回复，以及如何回复。
 """
 
-        # 调用Agent
-        result = await agent.ainvoke({"messages": [input_text]}, context=Context(session_id=session_id))
-        output = result.get("structured_response", None)
-        return output
+        messages = [HumanMessage(content=input_text)]
+        invoke_input: dict[str, Any] = {"messages": messages}
+        result = await agent.ainvoke(cast(Any, invoke_input), context=Context(session_id=session_id))
 
-    except Exception as e:
-        print(traceback.format_exc())
-        logger.error(f"Agent执行失败: {e}")
-        return ResponseMessage(need_reply=False, text="")
+        raw_output = result.get("structured_response")
+
+        # 情况 A: 如果 Agent 没返回 structured_response (为 None)
+        if raw_output is None:
+            logger.warning(f"Agent session {session_id} 未返回有效结构化数据")
+            # 返回一个默认的安全对象，防止报错
+            return ResponseMessage(need_reply=False, text=None)
+
+        # 情况 B: 如果 Agent 返回的是字典 (Dict)，需要转为 Pydantic 模型
+        if isinstance(raw_output, dict):
+            return ResponseMessage.model_validate(raw_output)
+
+        # 情况 C: 如果 Agent 直接返回了 ResponseMessage 对象 (某些高级Agent框架会这样)
+        if isinstance(raw_output, ResponseMessage):
+            return raw_output
+
+        # 兜底：虽然有值但类型不对
+        logger.error(f"Agent 返回类型未知: {type(raw_output)}")
+        return ResponseMessage(need_reply=False, text=None)
+
+    except Exception:
+        logger.exception("Agent 决策过程发生异常")
+        # 发生异常时也需要返回一个符合类型签名的对象
+        return ResponseMessage(need_reply=False, text=None)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     model = ChatOpenAI(
         model=plugin_config.openai_model,
-        api_key=plugin_config.openai_token,
-        base_url=plugin_config.base_url,
+        api_key=SecretStr(plugin_config.openai_token),
+        base_url=plugin_config.openai_base_url,
         temperature=0.7,
     )
     agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))

@@ -1,64 +1,64 @@
 import asyncio
 import datetime
+from io import BytesIO
+from pathlib import Path
 import random
 import traceback
 
 import jieba
-import aiofiles
-from io import BytesIO
-from pathlib import Path
-
-from nonebot import on_message, require, Bot, logger, get_plugin_config, on_command, get_driver
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.internal.adapter import Event, Message
-from nonebot.internal.rule import Rule
+from nonebot import get_plugin_config, logger, on_command, on_message, require
+from nonebot.internal.adapter import Bot, Event, Message
 from nonebot.params import CommandArg
+from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
-from wordcloud import WordCloud
 from PIL import Image as PILImage
+from wordcloud import WordCloud
+
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
-from nonebot_plugin_alconna import Image, image_fetch, UniMessage, get_message_id
-from nonebot_plugin_orm import async_scoped_session, get_session
+require("nonebot_plugin_uninfo")
+require("nonebot_plugin_localstore")
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_alconna import Image, UniMessage, get_message_id, image_fetch
 from nonebot_plugin_alconna.uniseg import UniMsg
+from nonebot_plugin_apscheduler import scheduler
+import nonebot_plugin_localstore as store
+from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_uninfo import Uninfo
 from sqlalchemy import Select
 from sqlalchemy.exc import IntegrityError
 
 from .agent import choice_response_strategy
+from .config import Config
 from .milvus import MilvusOP
-from .model import ChatHistory, MediaStorage, ChatHistorySchema, MediaStorageSchema
+from .model import ChatHistory, ChatHistorySchema, MediaStorage
 from .utils import (
-    generate_file_hash,
     check_and_compress_image_bytes,
-    bytes_to_base64,
+    generate_file_hash,
     process_and_vectorize_session_chats,
 )
 from .vlm import image_vl
-from .config import Config
 
-require("nonebot_plugin_localstore")
-require("nonebot_plugin_apscheduler")
-
-from nonebot_plugin_apscheduler import scheduler
-import nonebot_plugin_localstore as store
-
+__plugin_meta__ = PluginMetadata(
+    name="nonebot-plugin-ai-groupmate",
+    description="AI虚拟群友",
+    usage="@bot 让bot进行回复\n/词频 <统计天数>\n/群词频<统计天数>",
+    type="application",
+    homepage="https://github.com/yaowan233/nonebot-plugin-ai-groupmate",
+    config=Config,
+    supported_adapters=inherit_supported_adapters("nonebot_plugin_alconna", "nonebot_plugin_uninfo"),
+    extra={"author": "yaowan233 <572473053@qq.com>"},
+)
 plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config)
-with open(Path(__file__).parent / "stop_words.txt", "r", encoding="utf-8") as f:
-    stop_words = f.read().splitlines() + ["id"]
-
-
-async def check_group_permission(event: GroupMessageEvent):
-    # 检查是否为群聊
-    return True
+with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
+    stop_words = f.read().splitlines() + ["id", "回复"]
 
 
 record = on_message(
     priority=999,
-    rule=Rule(check_group_permission),
     block=True,
 )
 
@@ -73,21 +73,24 @@ async def handle_message(
         state: T_State,
 ):
     """处理消息的主函数"""
-    bot_name = plugin_config.bot_name
+    bot_name = plugin_config.ai_bot_name
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
     to_me = False
     is_text = False
     if event.is_tome():
         to_me = True
-        content += f"@{plugin_config.bot_name} "
+        content += f"@{plugin_config.ai_bot_name} "
     for i in msg:
         if i.type == "at":
             qq = i.target
-            res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
-            name = res["nickname"]
-            content += "@" + name + " "
-            is_text = True
+            try:
+                res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
+                name = res["nickname"]
+                content += "@" + name + " "
+                is_text = True
+            except Exception:
+                continue
         if i.type == "reply":
             content += "回复id:" + i.id
         if i.type == "text":
@@ -97,12 +100,14 @@ async def handle_message(
 
     # 构建用户名（包含昵称和职位）
     user_name = session.user.name
-    if session.member.nick:
-        user_name = f"({session.member.nick}){user_name}"
-    if session.member.role.name == "owner":
-        user_name = f"群主-{user_name}"
-    elif session.member.role.name == "admin":
-        user_name = f"管理员-{user_name}"
+    if session.member:
+        if session.member.nick:
+            user_name = f"({session.member.nick}){user_name}"
+        if session.member.role:
+            if session.member.role.name == "owner":
+                user_name = f"群主-{user_name}"
+            elif session.member.role.name == "admin":
+                user_name = f"管理员-{user_name}"
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     if is_text:
@@ -130,7 +135,7 @@ async def handle_message(
         )
 
     # ========== 步骤3: 决定是否回复 ==========
-    if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
+    if msg.extract_plain_text().strip().lower().startswith(plugin_config.ai_bot_name):
         to_me = True
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
     if not event.get_plaintext() and not imgs:
@@ -158,26 +163,27 @@ async def process_image_message(
         bot: Bot,
         state: T_State,
         session: Uninfo,
-        user_name: str,
+        user_name: str | None,
         content: str,
 ):
     """处理单张图片消息"""
+    content_type = "image"
+    if not img.id:
+        return
+    image_format = img.id.split(".")[-1]
+
+    # 获取和压缩图片
+    pic = await image_fetch(event, bot, state, img)
+    pic = await asyncio.to_thread(
+        check_and_compress_image_bytes, pic, image_format=image_format.upper()
+    )
+    file_hash = generate_file_hash(pic)
+    file_path = pic_dir / f"{file_hash}.{image_format}"
+
+    # 保存文件
+    if not file_path.exists():
+        file_path.write_bytes(pic)
     try:
-        content_type = "image"
-        image_format = img.id.split(".")[-1]
-
-        # 获取和压缩图片
-        pic = await image_fetch(event, bot, state, img)
-        pic = await asyncio.to_thread(
-            check_and_compress_image_bytes, pic, image_format=image_format.upper()
-        )
-        file_hash = generate_file_hash(pic)
-        file_path = pic_dir / f"{file_hash}.{image_format}"
-
-        # 保存文件
-        if not file_path.exists():
-            file_path.write_bytes(pic)
-
         # 查询或创建媒体记录
         existing_media = (
             await db_session.execute(
@@ -192,10 +198,7 @@ async def process_image_message(
             db_session.add(existing_media)
         else:
             # 新图片，调用VLM获取描述
-            base64_image = bytes_to_base64(pic)
-
-            # 调用 image_vl 时传入 Base64 字符串
-            image_description = await image_vl(base64_image)
+            image_description = await image_vl(file_path)
 
             if image_description:
                 media_storage = MediaStorage(
@@ -217,7 +220,7 @@ async def process_image_message(
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + image_description,
-                user_name=user_name,
+                user_name=user_name or "",
                 media_id=existing_media.media_id,
             )
             db_session.add(chat_history)
@@ -240,7 +243,7 @@ async def process_image_message(
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + existing_media.description,
-                user_name=user_name,
+                user_name=user_name or "",
                 media_id=existing_media.media_id,
             )
             db_session.add(chat_history)
@@ -256,7 +259,7 @@ async def handle_reply_logic(
         session: Uninfo,
         bot_name: str,
         user_id: str,
-        user_name: str,
+        user_name: str | None,
 ):
     """处理回复逻辑"""
     try:
@@ -403,7 +406,7 @@ async def vectorize_message_history():
 async def vectorize_media():
     async with get_session() as db_session:
         medias_res = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized == False)
+            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
         )
         medias = medias_res.scalars().all()
         logger.info(f"待向量化媒体数量: {len(medias)}")
@@ -417,11 +420,8 @@ async def vectorize_media():
                     db_session.add(media)
                     continue
 
-                pic_data = file_path.read_bytes()
-                base64_image = bytes_to_base64(pic_data)
-
                 # 判断是否适合作为表情包
-                vlm_res = await image_vl(base64_image, "请判断这张图适不适合作为表情包，只回答是或否")
+                vlm_res = await image_vl(file_path, "请判断这张图适不适合作为表情包，只回答是或否")
                 if not vlm_res or vlm_res != "是":
                     media.vectorized = True
                     db_session.add(media)
@@ -448,7 +448,6 @@ async def vectorize_media():
 @scheduler.scheduled_job("interval", minutes=35)
 async def clear_cache_pic():
     async with get_session() as db_session:
-        cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
         result = await db_session.execute(
             Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30))
         )
@@ -478,42 +477,3 @@ async def clear_cache_pic():
 
         await db_session.commit()
         logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
-
-
-
-async def check_superuser(event: Event) -> bool:
-    """检查事件的发送者是否为配置中的超级用户 (SUPERUSERS)"""
-    driver = get_driver()
-    superusers = driver.config.superusers
-    user_id = event.get_user_id()
-    return str(user_id) in superusers
-
-
-# -----------------------------------------------------------
-# 新增: 手动向量化命令
-# -----------------------------------------------------------
-
-manual_vectorize = on_command("手动向量化", permission=check_superuser, priority=5, block=True)
-@manual_vectorize.handle()
-async def handle_manual_vectorize(bot: Bot):
-    """手动执行所有向量化任务"""
-
-    await manual_vectorize.send("已收到手动向量化命令。正在启动：聊天历史向量化和媒体向量化...")
-
-    # --- 1. 执行聊天历史向量化 ---
-    try:
-        await vectorize_message_history()
-        await manual_vectorize.send("聊天历史向量化完成。", at_sender=True)
-    except Exception as e:
-        logger.error(f"手动向量化聊天历史失败: {e}")
-        await manual_vectorize.send(f"聊天历史向量化失败！请查看日志。错误: {e.__class__.__name__}", at_sender=True)
-
-    # --- 2. 执行媒体向量化 ---
-    try:
-        await vectorize_media()
-        await manual_vectorize.send("媒体文件向量化完成。", at_sender=True)
-    except Exception as e:
-        logger.error(f"手动向量化媒体文件失败: {e}")
-        await manual_vectorize.send(f"媒体文件向量化失败！请查看日志。错误: {e.__class__.__name__}", at_sender=True)
-
-    await manual_vectorize.finish("✨ 所有手动向量嵌入任务已完成，请检查日志。")
