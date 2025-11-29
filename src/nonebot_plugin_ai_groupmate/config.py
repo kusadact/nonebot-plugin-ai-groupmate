@@ -17,6 +17,3 @@ class Config(BaseModel):
     vlm_provider: str = "ollama"  # 可选: "ollama", "openai"
     vlm_openai_base_url: str = ""
     vlm_openai_api_key: str = ""
-    llm_provider: str = "gemini"  # 选项: "openai" 或 "gemini"
-    gemini_api_key: str = ""
-    gemini_model: str = ""
