@@ -108,8 +108,6 @@ record = on_message(
 @record.handle()
 async def handle_message(db_session: async_scoped_session, msg: UniMsg, session: Uninfo, event: Event, bot: Bot, state: T_State, interface: QryItrface):
     """处理消息的主函数"""
-    if not _is_enabled():
-        return
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
     to_me = False
@@ -166,6 +164,9 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
     # ========== 步骤2: 处理图片消息（耗时） ==========
     for img in imgs:
         await process_image_message(db_session, img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
+
+    if not _is_enabled():
+        return
 
     # ========== 步骤3: 决定是否回复 ==========
     if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
@@ -449,8 +450,6 @@ async def vectorize_media():
 
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
-    if not _is_enabled():
-        return
     async with get_session() as db_session:
         result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30)))
         medias = result.scalars().all()
