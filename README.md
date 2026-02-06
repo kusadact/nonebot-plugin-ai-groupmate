@@ -3,14 +3,6 @@
     <img src="https://raw.githubusercontent.com/fllesser/nonebot-plugin-template/refs/heads/resource/.docs/NoneBotPlugin.svg" width="310" alt="logo"></a>
 
 ## ✨ nonebot-plugin-ai-groupmate ✨
-[![LICENSE](https://img.shields.io/github/license/yaowan233/nonebot-plugin-ai-groupmate.svg)](./LICENSE)
-[![pypi](https://img.shields.io/pypi/v/nonebot-plugin-ai-groupmate.svg)](https://pypi.python.org/pypi/nonebot-plugin-ai-groupmate)
-[![python](https://img.shields.io/badge/python-3.10|3.11|3.12|3.13-blue.svg)](https://www.python.org)
-[![uv](https://img.shields.io/badge/package%20manager-uv-black?style=flat-square&logo=uv)](https://github.com/astral-sh/uv)
-<br/>
-[![ruff](https://img.shields.io/badge/code%20style-ruff-black?style=flat-square&logo=ruff)](https://github.com/astral-sh/ruff)
-[![pre-commit](https://results.pre-commit.ci/badge/github/yaowan233/nonebot-plugin-ai-groupmate/master.svg)](https://results.pre-commit.ci/latest/github/yaowan233/nonebot-plugin-ai-groupmate/master)
-[![codecov](https://codecov.io/gh/yaowan233/nonebot-plugin-ai-groupmate/graph/badge.svg?token=TMR6QZ6C6I)](https://codecov.io/gh/yaowan233/nonebot-plugin-ai-groupmate)
 
 </div>
 
@@ -27,9 +19,7 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 将模型计算远程化，nonebot-plugin-ai-groupmate插件只负责业务逻辑，模型端使用app.py部署，模型服务默认端口：8001
 
 图片向量化支持 base64 传输
-
 新增 superuser 手动开关，可临时禁用插件逻辑，使用关闭命令仅会关闭ai回复和向量库查询/写入，vlm和聊天记录数据库写入不受影响
-
 
 ## ⚙️ 配置
 
