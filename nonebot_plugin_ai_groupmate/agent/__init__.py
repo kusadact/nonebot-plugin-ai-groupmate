@@ -95,11 +95,27 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     """
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
-        similar_msgs = await MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
+
+        # Fast probe to avoid hanging the agent when Milvus (or the tunnel) is unavailable.
+        try:
+            client = MilvusOP._get_async_client()
+            try:
+                await asyncio.wait_for(client.list_collections(), timeout=2.0)
+            except AttributeError:
+                await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
+        except Exception as e:
+            logger.error(f"RAG skipped (Milvus unavailable): {e}")
+            return '未找到相关历史记录'
+
+        similar_msgs = await asyncio.wait_for(MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"'), timeout=8.0)
         return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
+
+    except asyncio.TimeoutError:
+        logger.error("RAG search timed out; skipped")
+        return '未找到相关历史记录'
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
-        return "历史搜索失败"
+        return '未找到相关历史记录'
 
 
 def create_report_tool(db_session, session_id: str, user_id: str, user_name: str | None, llm_client: ChatOpenAI):

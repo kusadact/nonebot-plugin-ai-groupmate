@@ -440,4 +440,6 @@ driver = get_driver()
 @driver.on_startup
 async def _():
     # 5. 在机器人启动时才真正下载模型、连接数据库
-    await MilvusOP.init_models()
+    # Do not block NoneBot startup on Milvus connectivity.
+    # Models/DB are initialized lazily on first use.
+    logger.info("Milvus init deferred until first use.")

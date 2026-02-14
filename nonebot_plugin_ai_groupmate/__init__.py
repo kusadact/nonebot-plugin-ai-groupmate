@@ -46,10 +46,10 @@ __plugin_meta__ = PluginMetadata(
     description="AI虚拟群友",
     usage="@bot 让bot进行回复\n/词频 <统计天数>\n/群词频<统计天数>",
     type="application",
-    homepage="https://github.com/yaowan233/nonebot-plugin-ai-groupmate",
+    homepage="https://github.com/kusadact/nonebot-plugin-ai-groupmate",
     config=Config,
     supported_adapters=inherit_supported_adapters("nonebot_plugin_alconna", "nonebot_plugin_uninfo"),
-    extra={"author": "yaowan233 <572473053@qq.com>"},
+    extra={"author": "kusadact <959472968@qq.com>"},
 )
 plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
@@ -76,27 +76,48 @@ def _set_enabled(value: bool) -> None:
     _enabled = value
     switch_file.write_text(json.dumps({"enabled": value}, ensure_ascii=False), encoding="utf-8")
 
-
-toggle_on = on_command("ai_groupmate_on", permission=SUPERUSER)
-toggle_off = on_command("ai_groupmate_off", permission=SUPERUSER)
-toggle_status = on_command("ai_groupmate_status", permission=SUPERUSER)
+ai = on_command("ai", permission=SUPERUSER)
 
 
-@toggle_on.handle()
-async def _():
-    _set_enabled(True)
-    await toggle_on.finish("ai_groupmate enabled")
+@ai.handle()
+async def _(arg: Message = CommandArg()):
+    sub = arg.extract_plain_text().strip().lower()
 
-
-@toggle_off.handle()
-async def _():
-    _set_enabled(False)
-    await toggle_off.finish("ai_groupmate disabled")
-
-
-@toggle_status.handle()
-async def _():
-    await toggle_status.finish(f"ai_groupmate status: {'on' if _is_enabled() else 'off'}")
+    if sub in {"on", "enable", "start", "1", "true", "开", "开启", "启用"}:
+        _set_enabled(True)
+        await ai.finish("ai enabled")
+    elif sub in {"off", "disable", "stop", "0", "false", "关", "关闭", "停用"}:
+        _set_enabled(False)
+        await ai.finish("ai disabled")
+    elif sub in {"status", "state", "s", "", "状态"}:
+        status = "on" if _is_enabled() else "off"
+        milvus_uri = (plugin_config.milvus_uri or "").strip()
+        milvus_state = "n/a"
+        milvus_detail = "not configured"
+        if milvus_uri:
+            is_remote = ("://" in milvus_uri) or (milvus_uri.count(":") == 1 and milvus_uri.rsplit(":", 1)[1].isdigit())
+            if not is_remote:
+                p = Path(milvus_uri)
+                milvus_detail = f"local:{p.as_posix()}"
+                milvus_state = "ok" if p.exists() else "down"
+            else:
+                try:
+                    client = MilvusOP._get_async_client()
+                    try:
+                        await asyncio.wait_for(client.list_collections(), timeout=2.0)
+                    except AttributeError:
+                        await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
+                    milvus_state = "ok"
+                    milvus_detail = milvus_uri
+                except asyncio.TimeoutError:
+                    milvus_state = "down"
+                    milvus_detail = f"timeout:{milvus_uri}"
+                except Exception as e:
+                    milvus_state = "down"
+                    milvus_detail = f"{type(e).__name__}:{milvus_uri}"
+        await ai.finish(f"ai status: {status}\nmilvus: {milvus_state} ({milvus_detail})")
+    else:
+        await ai.finish("Usage: /ai on|off|status")
 
 
 record = on_message(
