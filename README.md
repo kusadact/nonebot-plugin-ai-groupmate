@@ -16,10 +16,13 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 对于模型选择方面：推荐使用 glm-4.6 模型，以及本地部署 qwen3-vl 作为 vlm 模型，如果 embedding、 rerank、vlm 和 clip 模型都使用了显卡加速的话，大约需要 16G 显存的显卡。若只有 8G 显存，将 vlm 模型调整为 api 调用的话，就可以流畅使用了。
 
 ## 改动说明
-将模型计算远程化，nonebot-plugin-ai-groupmate插件只负责业务逻辑，模型端使用app.py部署，模型服务默认端口：8001
-
-图片向量化支持 base64 传输
-新增 superuser 手动开关，可临时禁用插件逻辑，使用关闭命令仅会关闭ai回复和向量库查询/写入，vlm和聊天记录数据库写入不受影响
+- 将 embedding / rerank / clip 等模型计算远程化：插件只负责业务逻辑，模型端使用 `server/app.py` 部署（默认监听 `8001`，可通过隧道/FRP 映射到 `18001`等端口）。
+- 图片向量化支持 base64 传输（`/clip/image` 的 `images_base64`）。
+- 新增 superuser 手动开关指令：`/ai on|off|status`
+  - `off` 仅停止 AI 回复与向量库查询/写入；VLM 识别与聊天记录入库不受影响。
+  - `status` 会实际请求 Milvus，并区分 `down (tunnel:...)` 与 `down (milvus:...)`。
+- 插件启动不再强依赖 Milvus 在线，Milvus 初始化延迟到首次使用。
+- RAG 在 Milvus 不可用/超时时会自动跳过，降级为普通对话（不会导致 bot 退出）。
 
 ## ⚙️ 配置
 
@@ -45,6 +48,14 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__vlm_openai_api_key | 否 | 无 | vlm openai api key |
 
 
+
+### 远程模型服务示例配置（端口映射）
+示例：模型服务监听 `8001`，通过隧道/FRP 映射到云端 `18001`；Milvus `19530` 映射到 `19350`：
+
+```env
+ai_groupmate__remote_model_base_url=http://127.0.0.1:18001
+ai_groupmate__milvus_uri=http://127.0.0.1:19350
+```
 
 ## 🎉 使用
 

@@ -92,30 +92,66 @@ async def _(arg: Message = CommandArg()):
     elif sub in {"status", "state", "s", "", "状态"}:
         status = "on" if _is_enabled() else "off"
         milvus_uri = (plugin_config.milvus_uri or "").strip()
-        milvus_state = "n/a"
-        milvus_detail = "not configured"
+        milvus_line = "n/a"
+
         if milvus_uri:
             is_remote = ("://" in milvus_uri) or (milvus_uri.count(":") == 1 and milvus_uri.rsplit(":", 1)[1].isdigit())
             if not is_remote:
+                # Milvus Lite / local file path
                 p = Path(milvus_uri)
-                milvus_detail = f"local:{p.as_posix()}"
-                milvus_state = "ok" if p.exists() else "down"
+                milvus_line = "ok" if p.exists() else "down (local)"
             else:
+                # TCP probe first: distinguish "tunnel down" vs "Milvus down" behind the tunnel.
+                host = None
+                port = None
                 try:
-                    client = MilvusOP._get_async_client()
+                    if "://" in milvus_uri:
+                        from urllib.parse import urlparse
+
+                        u = urlparse(milvus_uri)
+                        host = u.hostname
+                        port = u.port or 19530
+                    else:
+                        host, port_s = milvus_uri.rsplit(":", 1)
+                        port = int(port_s)
+                except Exception:
+                    host = None
+                    port = None
+
+                tunnel_ok: bool | None = None
+                tunnel_err = ""
+                if host and port:
                     try:
-                        await asyncio.wait_for(client.list_collections(), timeout=2.0)
-                    except AttributeError:
-                        await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-                    milvus_state = "ok"
-                    milvus_detail = milvus_uri
-                except asyncio.TimeoutError:
-                    milvus_state = "down"
-                    milvus_detail = f"timeout:{milvus_uri}"
-                except Exception as e:
-                    milvus_state = "down"
-                    milvus_detail = f"{type(e).__name__}:{milvus_uri}"
-        await ai.finish(f"ai status: {status}\nmilvus: {milvus_state} ({milvus_detail})")
+                        r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=0.8)
+                        w.close()
+                        try:
+                            await w.wait_closed()
+                        except Exception:
+                            pass
+                        tunnel_ok = True
+                    except asyncio.TimeoutError:
+                        tunnel_ok = False
+                        tunnel_err = "timeout"
+                    except Exception as e:
+                        tunnel_ok = False
+                        tunnel_err = type(e).__name__
+
+                if tunnel_ok is False:
+                    milvus_line = f"down (tunnel:{tunnel_err})" if tunnel_err else "down (tunnel)"
+                else:
+                    try:
+                        client = MilvusOP._get_async_client()
+                        try:
+                            await asyncio.wait_for(client.list_collections(), timeout=2.0)
+                        except AttributeError:
+                            await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
+                        milvus_line = "ok"
+                    except asyncio.TimeoutError:
+                        milvus_line = "down (milvus:timeout)"
+                    except Exception as e:
+                        milvus_line = f"down (milvus:{type(e).__name__})"
+
+        await ai.finish(f"ai status: {status}\nmilvus: {milvus_line}")
     else:
         await ai.finish("Usage: /ai on|off|status")
 
