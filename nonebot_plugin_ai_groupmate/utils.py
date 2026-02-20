@@ -49,40 +49,46 @@ def check_and_compress_image_bytes(image_bytes, max_size_mb=2, quality_start=95,
         return image_bytes
 
     try:
-        # 读取图片
-        img = Image.open(io.BytesIO(image_bytes))
+        with Image.open(io.BytesIO(image_bytes)) as raw_img:
+            img = raw_img.convert("RGB") if raw_img.mode != "RGB" else raw_img.copy()
 
         # 尝试不同的质量等级直到文件大小小于目标大小
-        quality = quality_start
+        quality = max(10, min(int(quality_start), 95))
         compressed_image = io.BytesIO()
-        compressed_size = compressed_image.tell()
+        compressed_size = file_size
 
-        while quality > 10:
+        while quality >= 10:
             compressed_image.seek(0)
             compressed_image.truncate(0)  # 清空BytesIO对象
-            if img.mode != "RGB":
-                img = img.convert("RGB")
             img.save(compressed_image, format=image_format, quality=quality, optimize=True)
+            compressed_size = compressed_image.tell()
 
             if compressed_size <= max_size_bytes:
                 break
 
             quality -= 15
 
-        # 如果压缩后的图像仍然大于目标大小，可以考虑调整图像尺寸
+        # 如果压缩后的图像仍然大于目标大小，则继续缩放，直到达标或无法再缩
         if compressed_size > max_size_bytes:
             logger.info("通过调整质量无法达到目标大小，尝试调整图像尺寸...")
-            width, height = img.size
-            ratio = (max_size_bytes / compressed_size) ** 0.5  # 估算缩放比例
+            while compressed_size > max_size_bytes:
+                width, height = img.size
+                if width <= 1 or height <= 1:
+                    break
 
-            new_width = int(width * ratio * 0.9)  # 稍微减小一点以确保大小达标
-            new_height = int(height * ratio * 0.9)
+                ratio = (max_size_bytes / compressed_size) ** 0.5  # 估算缩放比例
+                scale = max(0.1, min(ratio * 0.9, 0.95))
+                new_width = max(1, int(width * scale))
+                new_height = max(1, int(height * scale))
+                if new_width == width and new_height == height:
+                    break
 
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-            compressed_image.seek(0)
-            compressed_image.truncate(0)
-            img.save(compressed_image, format=image_format, quality=quality, optimize=True)
+                compressed_image.seek(0)
+                compressed_image.truncate(0)
+                img.save(compressed_image, format=image_format, quality=quality, optimize=True)
+                compressed_size = compressed_image.tell()
 
         compressed_bytes = compressed_image.getvalue()
         final_size = len(compressed_bytes)
