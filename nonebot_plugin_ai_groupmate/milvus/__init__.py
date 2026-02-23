@@ -22,42 +22,149 @@ from ..config import Config
 
 
 class RemoteModelClient:
-    def __init__(self, base_url: str, api_key: str = ""):
+    def __init__(
+        self,
+        base_url: str = "",
+        api_key: str = "",
+        embedding_base_url: str = "",
+        embedding_api_key: str = "",
+        embedding_model: str = "",
+        embedding_dimensions: int = 0,
+        rerank_base_url: str = "",
+        rerank_api_key: str = "",
+        rerank_model: str = "",
+        clip_base_url: str = "",
+        clip_api_key: str = "",
+    ):
+        # 兼容旧版：统一入口（/embed /rerank /clip）
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+
+        # 新版分路：embedding / rerank / clip 分别配置
+        self.embedding_base_url = embedding_base_url.rstrip("/")
+        self.embedding_api_key = embedding_api_key
+        self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
+
+        self.rerank_base_url = rerank_base_url.rstrip("/")
+        self.rerank_api_key = rerank_api_key
+        self.rerank_model = rerank_model
+
+        self.clip_base_url = clip_base_url.rstrip("/")
+        self.clip_api_key = clip_api_key
+
+    def _post_json_with_base(self, base_url: str, path: str, payload: dict, api_key: str = "") -> dict:
+        if not base_url:
+            raise RuntimeError("remote base_url is empty")
+        url = f"{base_url}{path}"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            raise RuntimeError(f"remote http error {e.code}: {body or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"remote request failed: {e}") from e
+        return json.loads(body)
 
     def _post_json(self, path: str, payload: dict) -> dict:
         if not self.base_url:
             raise RuntimeError("remote_model_base_url is empty")
-        url = f"{self.base_url}{path}"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read().decode("utf-8")
-        return json.loads(body)
+        return self._post_json_with_base(self.base_url, path, payload, self.api_key)
 
-    # Expected response: {"dense": [[...], ...]}
+    def _post_clip_json(self, path: str, payload: dict) -> dict:
+        # clip 优先走分路地址，未配置时回退到旧统一入口。
+        clip_base = self.clip_base_url or self.base_url
+        clip_key = self.clip_api_key or self.api_key
+        if not clip_base:
+            raise RuntimeError("remote_clip_base_url is empty")
+        return self._post_json_with_base(clip_base, path, payload, clip_key)
+
+    # 统一返回：{"dense": [[...], ...]}
     def embed_documents(self, texts: list[str]) -> dict:
+        # 配置了 embedding 分路时，按硅基流动/OpenAI 风格协议调用。
+        if self.embedding_base_url:
+            if not self.embedding_model:
+                raise RuntimeError("remote_embedding_model is empty")
+            payload: dict[str, Any] = {
+                "model": self.embedding_model,
+                "input": texts,
+            }
+            if self.embedding_dimensions > 0:
+                payload["dimensions"] = self.embedding_dimensions
+            data = self._post_json_with_base(
+                self.embedding_base_url,
+                "/v1/embeddings",
+                payload,
+                self.embedding_api_key or self.api_key,
+            )
+            dense: list[Any] = []
+            for item in data.get("data", []):
+                if isinstance(item, dict) and "embedding" in item:
+                    dense.append(item["embedding"])
+            if not dense:
+                raise RuntimeError(f"invalid embeddings response: {data}")
+            return {"dense": dense}
         return self._post_json("/embed", {"texts": texts})
 
-    # Expected response: {"results": [{"text": "...", "score": 0.1}, ...]}
+    # 统一返回：{"results": [{"text": "...", "score": 0.1}, ...]}
     def rerank(self, query: str, texts: list[str]) -> dict:
+        # 配置了 rerank 分路时，按硅基流动协议调用。
+        if self.rerank_base_url:
+            if not self.rerank_model:
+                raise RuntimeError("remote_rerank_model is empty")
+            payload = {
+                "model": self.rerank_model,
+                "query": query,
+                "documents": texts,
+                "top_n": len(texts),
+                "return_documents": True,
+            }
+            data = self._post_json_with_base(
+                self.rerank_base_url,
+                "/v1/rerank",
+                payload,
+                self.rerank_api_key or self.api_key,
+            )
+            normalized = []
+            for item in data.get("results", []):
+                if not isinstance(item, dict):
+                    continue
+                score = item.get("relevance_score", item.get("score", 0))
+                text = ""
+                doc = item.get("document")
+                if isinstance(doc, dict):
+                    text = doc.get("text", "")
+                elif isinstance(doc, str):
+                    text = doc
+                if not text:
+                    idx = item.get("index")
+                    if isinstance(idx, int) and 0 <= idx < len(texts):
+                        text = texts[idx]
+                normalized.append({"text": text, "score": float(score)})
+            return {"results": normalized}
         return self._post_json("/rerank", {"query": query, "texts": texts})
 
-    # Expected response: {"dense": [[...], ...]}
+    # 统一返回：{"dense": [[...], ...]}
     def clip_text(self, texts: list[str]) -> dict:
-        return self._post_json("/clip/text", {"texts": texts})
+        return self._post_clip_json("/clip/text", {"texts": texts})
 
-    # Expected response: {"dense": [[...], ...]}
+    # 统一返回：{"dense": [[...], ...]}
     def clip_image(self, image_urls: list[str]) -> dict:
-        return self._post_json("/clip/image", {"images": image_urls})
+        return self._post_clip_json("/clip/image", {"images": image_urls})
 
-    # Expected response: {"dense": [[...], ...]}
+    # 统一返回：{"dense": [[...], ...]}
     def clip_image_base64(self, images_base64: list[str]) -> dict:
-        return self._post_json("/clip/image", {"images_base64": images_base64})
+        return self._post_clip_json("/clip/image", {"images_base64": images_base64})
 
 
 def _image_to_base64(image_input) -> str:
@@ -123,10 +230,27 @@ class MilvusOperator:
 
         logger.info("Loading Milvus models and database connection...")
         try:
-            if plugin_config.remote_model_base_url:
+            use_remote = any(
+                [
+                    bool(plugin_config.remote_model_base_url),
+                    bool(plugin_config.remote_embedding_base_url),
+                    bool(plugin_config.remote_rerank_base_url),
+                    bool(plugin_config.remote_clip_base_url),
+                ]
+            )
+            if use_remote:
                 self.remote_client = RemoteModelClient(
                     base_url=plugin_config.remote_model_base_url,
                     api_key=plugin_config.remote_model_api_key,
+                    embedding_base_url=plugin_config.remote_embedding_base_url,
+                    embedding_api_key=plugin_config.remote_embedding_api_key,
+                    embedding_model=plugin_config.remote_embedding_model,
+                    embedding_dimensions=plugin_config.remote_embedding_dimensions,
+                    rerank_base_url=plugin_config.remote_rerank_base_url,
+                    rerank_api_key=plugin_config.remote_rerank_api_key,
+                    rerank_model=plugin_config.remote_rerank_model,
+                    clip_base_url=plugin_config.remote_clip_base_url,
+                    clip_api_key=plugin_config.remote_clip_api_key,
                 )
                 self.ef = None
                 self.bge_rf = None

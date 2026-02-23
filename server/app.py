@@ -1,29 +1,17 @@
 from io import BytesIO
 import base64
 from PIL import Image as PILImage
-import os
 
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
 from transformers import AutoModel, AutoTokenizer, AutoImageProcessor
-from pymilvus.model.hybrid import BGEM3EmbeddingFunction
-from pymilvus.model.reranker import BGERerankFunction
 
 
 app = FastAPI()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-ef = BGEM3EmbeddingFunction(
-    model_name="BAAI/bge-m3",
-    device=device,
-)
-reranker = BGERerankFunction(
-    model_name="BAAI/bge-reranker-v2-m3",
-    device=device,
-)
 
 clip_model = AutoModel.from_pretrained(
     "jinaai/jina-clip-v2",
@@ -48,28 +36,9 @@ class TextsReq(BaseModel):
     texts: list[str]
 
 
-class RerankReq(BaseModel):
-    query: str
-    texts: list[str]
-
-
 class ImagesReq(BaseModel):
     images: list[str] | None = None
     images_base64: list[str] | None = None
-
-
-@app.post("/embed")
-def embed(req: TextsReq):
-    out = ef.encode_documents(req.texts)
-    dense = out["dense"]
-    dense = [v.tolist() if hasattr(v, "tolist") else v for v in dense]
-    return {"dense": dense}
-
-
-@app.post("/rerank")
-def rerank(req: RerankReq):
-    results = reranker(req.query, req.texts)
-    return {"results": [{"text": r.text, "score": float(r.score)} for r in results]}
 
 
 @app.post("/clip/text")
