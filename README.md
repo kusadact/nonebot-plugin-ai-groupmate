@@ -37,6 +37,15 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__milvus_password | 否 | 无 | milvus 密码 |
 | ai_groupmate__remote_model_base_url | 否 | 无 | 远程模型服务地址（/embed /rerank /clip） |
 | ai_groupmate__remote_model_api_key | 否 | 无 | 远程模型服务 API Key |
+| ai_groupmate__remote_embedding_base_url | 否 | 无 | embedding 分路地址（硅基流动/OpenAI 风格） |
+| ai_groupmate__remote_embedding_api_key | 否 | 无 | embedding 分路 API Key（为空则回退用 remote_model_api_key） |
+| ai_groupmate__remote_embedding_model | 否 | 无 | embedding 模型名（如 `BAAI/bge-m3`） |
+| ai_groupmate__remote_embedding_dimensions | 否 | 0 | embedding 维度；`0` 表示不传 `dimensions` 字段 |
+| ai_groupmate__remote_rerank_base_url | 否 | 无 | rerank 分路地址（硅基流动） |
+| ai_groupmate__remote_rerank_api_key | 否 | 无 | rerank 分路 API Key（为空则回退用 remote_model_api_key） |
+| ai_groupmate__remote_rerank_model | 否 | 无 | rerank 模型名（如 `BAAI/bge-reranker-v2-m3`） |
+| ai_groupmate__remote_clip_base_url | 否 | 无 | clip 分路地址（本地/远程 clip 服务） |
+| ai_groupmate__remote_clip_api_key | 否 | 无 | clip 分路 API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__tavily_api_key | 否 | 无 | tavily api 密钥 |
 | ai_groupmate__openai_base_url | 否 | 无| openai 请求地址 |
 | ai_groupmate__openai_token | 否 | 无 | openai token |
@@ -55,6 +64,25 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 ```env
 ai_groupmate__remote_model_base_url=http://127.0.0.1:18001
 ai_groupmate__milvus_uri=http://127.0.0.1:19350
+```
+
+### embedding/rerank 走硅基流动 + clip 走本地示例
+说明：`remote_embedding_base_url` 与 `remote_rerank_base_url` 请填写 `https://api.siliconflow.cn`（不要再带 `/v1`，代码会自动拼接）。
+
+```env
+ai_groupmate__milvus_uri=http://127.0.0.1:19530
+
+ai_groupmate__remote_embedding_base_url=https://api.siliconflow.cn
+ai_groupmate__remote_embedding_api_key=sk-xxxx
+ai_groupmate__remote_embedding_model=BAAI/bge-m3
+ai_groupmate__remote_embedding_dimensions=0
+
+ai_groupmate__remote_rerank_base_url=https://api.siliconflow.cn
+ai_groupmate__remote_rerank_api_key=sk-xxxx
+ai_groupmate__remote_rerank_model=BAAI/bge-reranker-v2-m3
+
+ai_groupmate__remote_clip_base_url=http://127.0.0.1:18001
+ai_groupmate__remote_clip_api_key=
 ```
 
 ## 🎉 使用
