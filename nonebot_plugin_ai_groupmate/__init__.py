@@ -148,33 +148,74 @@ def _is_seedance_request(text: str) -> bool:
     if not t:
         return False
 
-    direct_hits = (
-        "生图",
-        "文生图",
-        "出图",
-        "画图",
-        "画个",
-        "画一下",
-        "帮我画",
-        "画一张",
-        "来张",
-        "来一张",
-        "生成图片",
-        "生成照片",
-        "生成相片",
-        "生成图像",
-        "生成一张",
-        "生成视频",
-        "文生视频",
-        "做视频",
-        "视频生成",
+    # 清理常见前缀，降低“假 at 文本”影响
+    if t.startswith("@"):
+        parts = t.split(maxsplit=1)
+        if len(parts) == 2:
+            t = parts[1].strip()
+
+    # 显式排除陈述/说明/提问句，避免误触发
+    deny_hits = (
+        "可以生成",
+        "能生成",
+        "会生成",
+        "支持生成",
+        "现在可以生成",
+        "用于生成",
+        "是否生成",
+        "怎么生成",
+        "如何生成",
+        "不生成",
+        "不要生成",
+        "别生成",
     )
-    if any(k in t for k in direct_hits):
+    if any(k in t for k in deny_hits):
+        return False
+
+    media_words = ("图", "图片", "照片", "相片", "图像", "视频", "短片", "海报", "壁纸")
+    action_words = ("生成", "画", "做", "出图", "生图", "文生图", "文生视频", "制作")
+    if not any(m in t for m in media_words):
+        return False
+    if not any(a in t for a in action_words):
+        return False
+
+    # 明确命令短语：优先判定为请求
+    direct_cmd_hits = (
+        "帮我生成",
+        "给我生成",
+        "请生成",
+        "麻烦生成",
+        "帮我画",
+        "给我画",
+        "请画",
+        "画一张",
+        "画个",
+        "来一张",
+        "来张",
+        "做个视频",
+        "生成一张",
+        "生成一个",
+        "生成一段",
+    )
+    if any(k in t for k in direct_cmd_hits):
         return True
 
-    verbs = ("生成", "画", "做", "整", "来")
-    media_words = ("图", "图片", "照片", "相片", "图像", "视频", "短片", "海报", "壁纸")
-    return any(v in t for v in verbs) and any(m in t for m in media_words)
+    # 句首就是命令动词，也判定为请求
+    command_starts = (
+        "生成",
+        "画",
+        "做",
+        "出图",
+        "生图",
+        "文生图",
+        "文生视频",
+    )
+    if t.startswith(command_starts):
+        return True
+
+    # 最后兜底：要求同时出现“请求语气 + 动作 + 媒体”
+    request_tones = ("帮我", "给我", "请", "麻烦", "求", "我要", "我想要")
+    return any(r in t for r in request_tones) and any(a in t for a in action_words) and any(m in t for m in media_words)
 
 
 def _is_seedance_video_request(text: str) -> bool:
