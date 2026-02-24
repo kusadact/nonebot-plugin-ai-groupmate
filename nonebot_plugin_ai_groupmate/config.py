@@ -33,6 +33,38 @@ class ScopedConfig(BaseModel):
     vlm_provider: str = "ollama"  # 可选: "ollama", "openai"
     vlm_openai_base_url: str = ""
     vlm_openai_api_key: str = ""
+    # Seedance 文生图/视频配置（先用于白名单能力测试）
+    seedance_base_url: str = ""
+    seedance_api_key: str = ""
+    # 即梦官方 OpenAPI（AK/SK）配置
+    seedance_access_key_id: str = ""
+    seedance_secret_access_key: str = ""
+    seedance_endpoint: str = "https://visual.volcengineapi.com"
+    seedance_region: str = "cn-north-1"
+    seedance_service: str = "cv"
+    seedance_action_submit: str = "CVSync2AsyncSubmitTask"
+    seedance_action_result: str = "CVSync2AsyncGetResult"
+    seedance_api_version: str = "2022-08-31"
+    # 不同场景可分别指定 req_key（以控制台文档为准）
+    seedance_image_t2i_req_key: str = "jimeng_t2i_v40"
+    seedance_image_i2i_req_key: str = "jimeng_i2i_v30"
+    seedance_video_t2v_req_key: str = "jimeng_t2v_v30"
+    seedance_video_i2v_req_key: str = "jimeng_i2v_v30"
+    seedance_image_model: str = ""
+    seedance_video_model: str = ""
+    # 仅这些 QQ 号可以调用 Seedance 相关工具
+    seedance_tool_whitelist: list[str] = Field(default_factory=list)
+    # 公开静态目录根路径（会写入 temp/<request_id>/xx.png）
+    seedance_static_dir: str = ""
+    # 与 seedance_static_dir 对应的公网 URL 前缀，例如 https://example.com/static
+    seedance_static_base_url: str = ""
+    # 临时参考图清理时间（分钟）
+    seedance_temp_ttl_minutes: int = 30
+    # 参考图最多使用数量
+    seedance_max_reference_images: int = 2
+    # 任务轮询配置
+    seedance_poll_interval_seconds: int = 3
+    seedance_poll_timeout_seconds: int = 90
 
 
 class Config(BaseModel):
