@@ -907,8 +907,8 @@ async def _handle_seedance_request_direct(
     whitelist = _get_seedance_whitelist()
     request_id = f"seedance_gate_{int(datetime.datetime.now().timestamp())}_{random.randint(1000, 9999)}"
 
-    # 非白名单：直接忽略，不回复
-    if caller_id not in whitelist:
+    # 白名单为空时默认所有人可用；白名单有值时才做拦截
+    if whitelist and caller_id not in whitelist:
         logger.warning(
             f"[SeedanceGate] request_id={request_id} auth_passed=false "
             f"caller={caller_id} session_id={session.scene.id} action=ignore"
@@ -978,6 +978,14 @@ async def _handle_seedance_request_direct(
                         f"但落盘失败: {type(e).__name__}: {e}"
                     )
         media_name = "视频" if is_video else "图片"
+        max_output_images = max(1, int(getattr(plugin_config, "seedance_max_output_images", 1)))
+        if not is_video and result_urls:
+            if len(result_urls) > max_output_images:
+                logger.info(
+                    f"[SeedanceGate] request_id={request_id} clip image outputs "
+                    f"{len(result_urls)} -> {max_output_images}"
+                )
+            result_urls = result_urls[:max_output_images]
 
         if ref_images:
             ref_desc = f"参考图数量={len(ref_images)}（顺序按用户发送）\n"

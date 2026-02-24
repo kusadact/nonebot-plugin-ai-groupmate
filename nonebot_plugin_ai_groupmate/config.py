@@ -62,6 +62,8 @@ class ScopedConfig(BaseModel):
     seedance_temp_ttl_minutes: int = 30
     # 参考图最多使用数量
     seedance_max_reference_images: int = 2
+    # 出图数量上限（仅图片任务生效，默认 1）
+    seedance_max_output_images: int = 1
     # 任务轮询配置
     seedance_poll_interval_seconds: int = 3
     seedance_poll_timeout_seconds: int = 90
