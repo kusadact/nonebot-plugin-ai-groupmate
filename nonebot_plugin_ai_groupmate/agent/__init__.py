@@ -373,7 +373,11 @@ def create_similar_meme_tool(db_session, session_id: str):
             # 从数据库获取每张图片的详细信息
             images_info = []
             for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
-                pic = (await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == int(pic_id)))).scalar()
+                pic = (
+                    await db_session.execute(
+                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id), MediaStorage.blocked.is_(False))
+                    )
+                ).scalar()
 
                 if pic:
                     images_info.append(
@@ -382,6 +386,10 @@ def create_similar_meme_tool(db_session, session_id: str):
                             "description": pic.description,
                         }
                     )
+
+            if not images_info:
+                logger.info(f"相似图检索结果均被黑名单过滤: {description}")
+                return "没有搜索到相似图片"
 
             return json.dumps(
                 {
@@ -474,7 +482,11 @@ def create_search_meme_tool(db_session):
             # 从数据库获取每张图片的详细信息
             images_info = []
             for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
-                pic = (await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == int(pic_id)))).scalar()
+                pic = (
+                    await db_session.execute(
+                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id), MediaStorage.blocked.is_(False))
+                    )
+                ).scalar()
 
                 if pic:
                     images_info.append(
@@ -549,6 +561,9 @@ def create_send_meme_tool(db_session, session_id: str):
             if not pic:
                 logger.warning(f"图片记录不存在: {selected_pic_id}")
                 return "图片记录不存在"
+            if pic.blocked:
+                logger.info(f"图片已被拉黑，拒绝发送: {selected_pic_id}")
+                return "该表情包已被拉黑，禁止发送"
 
             pic_path = pic_dir / pic.file_path
 
@@ -568,6 +583,7 @@ def create_send_meme_tool(db_session, session_id: str):
                 content_type="bot",
                 content=f"id:{res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
                 user_name=plugin_config.bot_name,
+                media_id=selected_pic_id,
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
