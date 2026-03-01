@@ -598,78 +598,6 @@ def create_send_meme_tool(db_session, session_id: str):
     return send_meme_image
 
 
-def create_seedance_image_test_tool(user_id: str | None, session_id: str):
-    """
-    创建 Seedance 生图测试工具（仅白名单用户可调用）。
-    当前仅用于验证白名单逻辑，不会真实调用第三方生成接口。
-    """
-
-    @tool("seedance_generate_image_test")
-    async def seedance_generate_image_test(prompt: str) -> str:
-        """
-        测试 Seedance 生图权限控制。
-
-        参数:
-        - prompt: 生图提示词（测试用）
-        返回:
-        - JSON 字符串，包含是否授权、调用者和模拟任务ID
-        """
-        caller = str(user_id).strip() if user_id else ""
-        request_id = f"seedance_req_{int(datetime.datetime.now().timestamp())}_{random.randint(1000, 9999)}"
-        whitelist = {str(i).strip() for i in plugin_config.seedance_tool_whitelist if str(i).strip()}
-
-        logger.info(
-            f"[SeedanceAudit] request_id={request_id} caller={caller or 'unknown'} "
-            f"session_id={session_id} whitelist_size={len(whitelist)} prompt={prompt}"
-        )
-
-        if not whitelist:
-            logger.warning(f"[SeedanceAudit] request_id={request_id} auth_passed=false reason=empty_whitelist")
-            return json.dumps(
-                {
-                    "success": False,
-                    "request_id": request_id,
-                    "auth_passed": False,
-                    "reason": "seedance_tool_whitelist 为空，已拒绝调用",
-                    "caller": caller or "unknown",
-                },
-                ensure_ascii=False,
-            )
-
-        if caller not in whitelist:
-            logger.warning(f"Seedance tool denied: caller={caller or 'unknown'}")
-            logger.warning(f"[SeedanceAudit] request_id={request_id} auth_passed=false reason=caller_not_in_whitelist")
-            return json.dumps(
-                {
-                    "success": False,
-                    "request_id": request_id,
-                    "auth_passed": False,
-                    "reason": "权限不足，当前QQ不在 Seedance 白名单中",
-                    "caller": caller or "unknown",
-                },
-                ensure_ascii=False,
-            )
-
-        task_id = f"seedance_test_{int(datetime.datetime.now().timestamp())}"
-        logger.info(f"Seedance tool allowed: caller={caller}, task_id={task_id}, prompt={prompt}")
-        logger.success(f"[SeedanceAudit] request_id={request_id} auth_passed=true caller={caller} task_id={task_id}")
-        return json.dumps(
-            {
-                "success": True,
-                "request_id": request_id,
-                "auth_passed": True,
-                "mode": "test_only",
-                "task_id": task_id,
-                "caller": caller,
-                "prompt": prompt,
-                "message": "白名单校验通过。该工具当前为测试模式，尚未调用真实 Seedance API。",
-            },
-            ensure_ascii=False,
-        )
-
-    return seedance_generate_image_test
-
-
 @tool("calculate_expression")
 def calculate_expression(expression: str) -> str:
     """
@@ -890,9 +818,6 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
    - 在聊天记录中找到用户发送的图片消息的 `id:xxxxx`。
    - 调用 `search_similar_meme_by_id(target_msg_id="xxxxx")`。
    - 根据返回结果，选择一张合适的，再调用 `send_meme_image` 发送。
-
-【Seedance 生图】
-生图请求由插件主流程处理，不在 Agent 工具中调用。
 
 【RAG 工具使用规则】
 
