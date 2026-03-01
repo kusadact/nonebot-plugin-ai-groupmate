@@ -3,12 +3,13 @@ import asyncio
 import datetime
 import traceback
 import json
+import re
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import jieba
-from PIL import Image as PILImage
-from nonebot import logger, require, on_command, on_message, get_plugin_config
+from nonebot import logger, require, on_command, on_message, get_plugin_config, get_driver
 from nonebot.permission import SUPERUSER
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
@@ -22,7 +23,7 @@ require("nonebot_plugin_uninfo")
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
-from sqlalchemy import Select
+from sqlalchemy import Select, desc
 from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
@@ -66,7 +67,6 @@ if switch_file.exists():
     except Exception:
         _enabled = True
 
-
 def _is_enabled() -> bool:
     return _enabled
 
@@ -75,6 +75,289 @@ def _set_enabled(value: bool) -> None:
     global _enabled
     _enabled = value
     switch_file.write_text(json.dumps({"enabled": value}, ensure_ascii=False), encoding="utf-8")
+
+
+def _event_at_bot(event: Event, bot: Bot) -> bool:
+    # OneBot v11 fallback: directly inspect raw message segments.
+    try:
+        raw_msg = getattr(event, "message", None) or getattr(event, "original_message", None)
+        if not raw_msg:
+            return False
+
+        for seg in raw_msg:
+            seg_type = getattr(seg, "type", None)
+            if seg_type != "at":
+                continue
+            data = getattr(seg, "data", None)
+            qq = None
+            if isinstance(data, dict):
+                qq = data.get("qq") or data.get("target")
+            if qq is None:
+                qq = getattr(seg, "qq", None) or getattr(seg, "target", None)
+            if qq is not None and str(qq).strip() == str(bot.self_id):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _extract_reply_message_id_from_event(event: Event) -> str | None:
+    def _pick_reply_id(obj: Any) -> str | None:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            rid = obj.get("id") or obj.get("message_id")
+            if rid is not None and str(rid).strip():
+                return str(rid).strip()
+        rid = getattr(obj, "id", None) or getattr(obj, "message_id", None)
+        if rid is not None and str(rid).strip():
+            return str(rid).strip()
+        return None
+
+    try:
+        # Some adapters may expose a structured reply object directly.
+        rid = _pick_reply_id(getattr(event, "reply", None))
+        if rid:
+            return rid
+
+        raw_msg = getattr(event, "message", None) or getattr(event, "original_message", None)
+        if raw_msg:
+            for seg in raw_msg:
+                seg_type = getattr(seg, "type", None)
+                if seg_type != "reply":
+                    continue
+                rid = _pick_reply_id(getattr(seg, "data", None)) or _pick_reply_id(seg)
+                if rid:
+                    return rid
+
+            # OneBot v11 常见字符串形态：[reply:id=123456]
+            text = str(raw_msg)
+            m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", text)
+            if m:
+                return m.group(1)
+
+        # Last fallback: parse serialized event text.
+        event_text = str(event)
+        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", event_text)
+        if m:
+            return m.group(1)
+    except Exception:
+        return None
+    return None
+
+
+async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
+    text = (plain_text or "").strip()
+    if not text:
+        return False
+    if not (text.startswith("@") or text.startswith("＠")):
+        return False
+
+    bot_names: set[str] = set()
+    configured = (plugin_config.bot_name or "").strip()
+    if configured:
+        bot_names.add(configured)
+
+    try:
+        members = await interface.get_members(SceneType.GROUP, session.scene.id)
+    except Exception:
+        members = []
+
+    bot_id = str(bot.self_id)
+    for member in members:
+        if str(member.id) != bot_id:
+            continue
+        if member.user and member.user.name:
+            bot_names.add(str(member.user.name).strip())
+        if getattr(member, "nick", None):
+            bot_names.add(str(member.nick).strip())
+        break
+
+    low_text = text.lower()
+    for name in bot_names:
+        if not name:
+            continue
+        n = name.lower()
+        if low_text.startswith(f"@{n}") or low_text.startswith(f"＠{n}"):
+            return True
+    return False
+
+
+_MEME_BLOCK_FEEDBACK_KEYWORDS = (
+    "不可以",
+    "不行",
+    "不能",
+    "别发",
+    "别再发",
+    "不要这张",
+)
+
+_MEME_BLOCK_CONFIRM_TEMPLATES = (
+    "{bot_name}知道错了...达咩!",
+    "{bot_name}不会再发这个表情包了...",
+    "果面呐噻,{bot_name}发错表情包了...",
+    "{bot_name}有说什么奇怪的话吗？",
+)
+
+
+def _user_id_aliases(raw_id: str | None) -> set[str]:
+    raw = str(raw_id or "").strip()
+    if not raw:
+        return set()
+
+    aliases: set[str] = {raw}
+    if ":" in raw:
+        aliases.add(raw.rsplit(":", 1)[-1].strip())
+
+    # 兜底抽取末尾数字，兼容 onebot/qq 前缀差异
+    m = re.search(r"(\d+)$", raw)
+    if m:
+        aliases.add(m.group(1))
+    return {a for a in aliases if a}
+
+
+def _is_superuser_id(user_id: str | None) -> bool:
+    uid_aliases = _user_id_aliases(user_id)
+    if not uid_aliases:
+        return False
+
+    try:
+        superusers = {str(i).strip() for i in get_driver().config.superusers}
+    except Exception:
+        superusers = set()
+
+    for su in superusers:
+        if uid_aliases & _user_id_aliases(su):
+            return True
+    return False
+
+
+def _is_meme_block_feedback(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(k in t for k in _MEME_BLOCK_FEEDBACK_KEYWORDS)
+
+
+async def _try_auto_block_replied_meme(
+    db_session: async_scoped_session,
+    session_id: str,
+    sender_user_id: str | None,
+    event: Event,
+    bot: Bot,
+    reply_message_id: str | None,
+    plain_text: str,
+) -> bool:
+    if not _is_meme_block_feedback(plain_text):
+        return False
+
+    if not reply_message_id:
+        logger.info(f"[MemeBlock] feedback_hit_but_reply_id_missing session_id={session_id} sender={sender_user_id}")
+        return False
+
+    try:
+        is_superuser = await SUPERUSER(bot, event)
+    except Exception:
+        is_superuser = _is_superuser_id(sender_user_id)
+
+    if not is_superuser:
+        logger.info(
+            f"[MemeBlock] feedback_hit_but_not_superuser session_id={session_id} "
+            f"sender={sender_user_id} reply_to={reply_message_id}"
+        )
+        return False
+
+    stmt = (
+        Select(ChatHistory)
+        .where(
+            ChatHistory.session_id == session_id,
+            ChatHistory.content_type == "bot",
+            ChatHistory.content.like(f"%id:{reply_message_id}%"),
+        )
+        .order_by(desc(ChatHistory.created_at))
+        .limit(1)
+    )
+    target = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    if target is None:
+        stmt = (
+            Select(ChatHistory)
+            .where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.content_type == "bot",
+                ChatHistory.content.like(f"%id: {reply_message_id}%"),
+            )
+            .order_by(desc(ChatHistory.created_at))
+            .limit(1)
+        )
+        target = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    if not target:
+        logger.info(
+            f"[MemeBlock] feedback_hit_but_target_not_found "
+            f"session_id={session_id} reply_to={reply_message_id}"
+        )
+        return False
+
+    media_id: int | None = int(target.media_id) if target.media_id is not None else None
+    if media_id is None:
+        marker = "图片描述是:"
+        sent_content = target.content or ""
+        if marker in sent_content:
+            desc_text = sent_content.split(marker, 1)[1].strip()
+            if desc_text:
+                by_desc = (
+                    Select(MediaStorage)
+                    .where(MediaStorage.description == desc_text)
+                    .order_by(desc(MediaStorage.media_id))
+                    .limit(1)
+                )
+                media_by_desc = (await db_session.execute(by_desc)).scalar_one_or_none()
+                if media_by_desc:
+                    media_id = int(media_by_desc.media_id)
+
+    if media_id is None:
+        logger.info(
+            f"[MemeBlock] feedback_hit_but_media_id_missing "
+            f"session_id={session_id} reply_to={reply_message_id}"
+        )
+        return False
+
+    media = (
+        await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == media_id))
+    ).scalar_one_or_none()
+    if not media:
+        return False
+
+    media_id_int = int(media_id)
+    changed = not bool(media.blocked)
+    if changed:
+        media.blocked = True
+        db_session.add(media)
+        try:
+            await db_session.commit()
+        except Exception as e:
+            await db_session.rollback()
+            logger.error(
+                f"[MemeBlock] update blocked flag failed: media_id={media_id_int} "
+                f"err={type(e).__name__}: {e}"
+            )
+            return False
+    logger.info(
+        f"[MemeBlock] superuser={sender_user_id} session_id={session_id} "
+        f"reply_to={reply_message_id} media_id={media_id_int} changed={changed}"
+    )
+    try:
+        bot_name = (plugin_config.bot_name or "bot").strip() or "bot"
+        if changed:
+            tip = random.choice(_MEME_BLOCK_CONFIRM_TEMPLATES).format(bot_name=bot_name)
+        else:
+            tip = f"该表情包已在黑名单中（id={media_id_int}）。"
+        await UniMessage.text(tip).send(reply_to=True)
+    except Exception as e:
+        logger.warning(f"[MemeBlock] 发送拉黑提示失败: {type(e).__name__}: {e}")
+    return True
+
 
 ai = on_command("ai", permission=SUPERUSER)
 
@@ -169,11 +452,19 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
     content = f"id: {get_message_id()}\n"
     to_me = False
     is_text = False
-    if event.is_tome():
+    reply_to_message_id: str | None = None
+    if event.is_tome() or _event_at_bot(event, bot):
         to_me = True
         content += f"@{plugin_config.bot_name} "
+
+    at_targets: list[str] = []
     for i in msg:
         if i.type == "at":
+            target_id = str(getattr(i, "target", "") or "").strip()
+            if target_id:
+                at_targets.append(target_id)
+            if target_id and target_id == str(bot.self_id):
+                to_me = True
             members = await interface.get_members(SceneType.GROUP, session.scene.id)
             for member in members:
                 if member.id == i.target:
@@ -184,10 +475,26 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
             content += "@" + name + " "
             is_text = True
         if i.type == "reply":
-            content += "回复id:" + i.id
+            rid = str(getattr(i, "id", "") or "").strip()
+            if not rid:
+                data = getattr(i, "data", None)
+                if isinstance(data, dict):
+                    rid = str(data.get("id") or data.get("message_id") or "").strip()
+            if not rid:
+                rid = str(getattr(i, "message_id", "") or "").strip()
+            if rid and not reply_to_message_id:
+                reply_to_message_id = rid
+                content += "回复id:" + rid
         if i.type == "text":
             content += i.text
             is_text = True
+
+    if not reply_to_message_id:
+        reply_to_message_id = _extract_reply_message_id_from_event(event)
+    if not reply_to_message_id:
+        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", str(msg))
+        if m:
+            reply_to_message_id = m.group(1)
 
     # 构建用户名（包含昵称和职位）
     user_name = session.user.name
@@ -222,18 +529,44 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
     for img in imgs:
         await process_image_message(db_session, img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
 
+    plain_text = (msg.extract_plain_text() or event.get_plaintext() or "").strip()
+    if await _try_auto_block_replied_meme(
+        db_session,
+        session.scene.id,
+        session.user.id,
+        event,
+        bot,
+        reply_to_message_id,
+        plain_text,
+    ):
+        return
+
     if not _is_enabled():
         return
 
     # ========== 步骤3: 决定是否回复 ==========
-    if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
+    plain_event_text = event.get_plaintext() or ""
+
+    bot_name_l = (plugin_config.bot_name or "").strip().lower()
+    if bot_name_l and (
+        plain_text.lower().startswith(bot_name_l)
+        or plain_text.lower().startswith(f"@{bot_name_l}")
+    ):
         to_me = True
+    elif not to_me and await _plain_text_mentions_bot(plain_text, bot, session, interface):
+        to_me = True
+
+    logger.debug(
+        f"[ToMeCheck] event.is_tome={event.is_tome()} bot.self_id={bot.self_id} "
+        f"at_targets={at_targets} bot_name={plugin_config.bot_name!r} to_me={to_me}"
+    )
+
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
-    if not event.get_plaintext() and not imgs:
+    if not plain_event_text and not imgs:
         should_reply = False
-    if event.get_plaintext().startswith(("!", "！", "/", "#", "?", "\\")):
+    if plain_event_text.startswith(("!", "！", "/", "#", "?", "\\")):
         should_reply = False
-    if not event.get_plaintext() and not event.is_tome():
+    if not plain_event_text and not event.is_tome():
         should_reply = False
     if to_me:
         user_id = session.user.id
@@ -508,7 +841,7 @@ async def vectorize_media():
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with get_session() as db_session:
-        result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30)))
+        result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=15)))
         medias = result.scalars().all()
 
         if not medias:
