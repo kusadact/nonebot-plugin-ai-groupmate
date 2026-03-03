@@ -718,7 +718,8 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             # 赋值回数据库对象
             relation.tags = current_tags
             relation.user_name = user_name or ""  # 同步更新昵称
-            favorability = relation.favorability
+            favorability = transition.new_score
+            favorability_raw = transition.new_raw
 
             await db_session.commit()
 
@@ -740,7 +741,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             log_msg = f"好感度 {old_score}->{favorability}{tag_msg} ({meta}) (原因: {reason})"
             logger.info(f"用户[{user_name}]画像更新: {log_msg}")
 
-            return f"画像已更新。当前好感度(映射/原始): {favorability}/{relation.favorability_raw}，当前标签: {current_tags}"
+            return f"画像已更新。当前好感度(映射/原始): {favorability}/{favorability_raw}，当前标签: {current_tags}"
 
         except Exception as e:
             logger.error(f"关系更新失败: {e}")
