@@ -1,9 +1,10 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, String, Boolean
+from sqlalchemy import JSON, String, Boolean, Float, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
+from .favorability import status_desc_from_raw
 
 
 class MediaStorage(Model):
@@ -45,27 +46,29 @@ class ChatHistory(Model):
 class UserRelation(Model):
     """用户关系/好感度表"""
 
+    __tablename__ = "nonebot_plugin_ai_groupmate_userrelation_v2"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_nonebot_plugin_ai_groupmate_userrelation_v2_user_id"),)
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(index=True)
     user_name: Mapped[str]
-    favorability: Mapped[int] = mapped_column(default=0)  # 好感度，默认0
+    favorability: Mapped[int] = mapped_column(default=0, index=True)  # 兼容旧逻辑的显示分
+    favorability_raw: Mapped[int] = mapped_column(default=0, index=True)  # Monika风格原始分
+    state: Mapped[str] = mapped_column(String(32), default="normal", index=True)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    daily_gain_used: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_bypass_used: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_gain_bank: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_cap: Mapped[float] = mapped_column(Float, default=7.0)
+    cap_reset_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
+    last_interact_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
+    last_penalty_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    apology_counts: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now)
 
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
-        score = self.favorability
-        if score <= -30:
-            return "厌恶/仇视"
-        if score <= -10:
-            return "冷淡/防备"
-        if score <= 10:
-            return "陌生/普通"
-        if score <= 40:
-            return "友善/熟人"
-        if score <= 70:
-            return "亲密/死党"
-        return "恋人/依赖"
+        return status_desc_from_raw(self.favorability_raw)
 
 
 class ChatHistorySchema(BaseModel):

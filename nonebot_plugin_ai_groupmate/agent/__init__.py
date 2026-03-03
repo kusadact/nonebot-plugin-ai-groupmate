@@ -29,6 +29,7 @@ from langchain.agents.structured_output import ToolStrategy
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
 from ..config import Config
+from ..favorability import apply_monika_favorability_change
 from ..milvus import MilvusOP
 
 require("nonebot_plugin_localstore")
@@ -224,13 +225,23 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             relation = (await db_session.execute(relation_stmt)).scalar_one_or_none()
 
             favorability = 0
+            favorability_raw = 0
+            relation_state = "normal"
+            relation_state_desc = "陌生/普通"
             impression_tags = []
             if relation:
                 favorability = relation.favorability
+                favorability_raw = relation.favorability_raw
+                relation_state = relation.state or "normal"
+                relation_state_desc = relation.get_status_desc()
                 impression_tags = relation.tags if relation.tags else []
 
             # 格式化关系描述，喂给 LLM
-            relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
+            relation_desc = (
+                f"关系状态: {relation_state} ({relation_state_desc}), "
+                f"分值(映射分/原始分): {favorability}/{favorability_raw}, "
+                f"印象标签: {', '.join(impression_tags)}"
+            )
 
 
             # 构造一个专门写报告的 Prompt
@@ -243,10 +254,11 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
 你的任务是阅读用户的聊天统计数据和发言样本，分析其性格，然后生成一份格式整洁、风格幽默的年度报告。
 
 【语气控制指南 (非常重要)】
-根据用户的“好感度”调整你的语气：
-- 好感度 > 60：语气要亲密、宠溺，像对待最好的朋友或恋人。（例如：“宝，今年你也一直陪着我呢”）
-- 好感度 < 0：语气要傲娇、嫌弃、毒舌。（例如：“你这家伙今年没少气我，明年注意点！”）
-- 好感度 0-60：语气正常、友善、带点调侃。
+根据用户的“关系状态”调整你的语气：
+- 状态为 happy / affectionate / enamored / love：语气更亲密、偏宠溺，可以适当煽情。
+- 状态为 upset / distressed / broken：语气可傲娇、嫌弃、带吐槽，但不要失控辱骂。
+- 状态为 normal：语气正常、友善、带一点调侃。
+关系状态是主依据；分值只作参考。其中“映射分”用于展示，“原始分”才是核心变化依据。
 
 【排版要求】
 1. **绝对禁止使用 Markdown**（不要用 #, **, ##, - 等符号列表）。
@@ -256,7 +268,7 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
 【必须包含的板块】
 1. 📊 标题行 ({year}年度报告 | 用户名)
 2. 📈 基础数据 (发言数、活跃时间、最长发言摘要)
-3. 💌 我们的羁绊 (根据好感度和标签，写一段话回顾你们的关系。如果是正向关系就煽情一点，负向关系就吐槽。)
+3. 💌 我们的羁绊 (根据关系状态与标签，写一段话回顾你们的关系。正向关系可煽情，负向关系可吐槽。)
 4. 🔥 年度热词 (列出数据中提供的热词)
 5. 🏆 群内风云榜 (必须包含以下三个榜单)
    - 🗣️ 龙王榜 (发言最多)
@@ -309,7 +321,7 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 "samples": "\n".join(samples),  # 把样本拼接成字符串喂给 LLM
             }
 
-            logger.info(f"内部 LLM 生成报告中，好感度: {favorability}")
+            logger.info(f"内部 LLM 生成报告中，状态: {relation_state}, 分值(映射/原始): {favorability}/{favorability_raw}")
             chain = report_prompt | llm_client
             response_msg = await chain.ainvoke(prompt_input)
             final_report_text = response_msg.content
@@ -702,7 +714,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
         当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
 
         参数:
-        - score_change: 好感度变化值（正数加分，负数扣分）。
+        - score_change: 好感度意图变化值（正数加分，负数扣分）。常规建议 -8~+8，明显事件可用 -15~+15，极端上限 -30~+30；最终实际变化会被状态、日上限、bank、道歉衰减等规则二次调整。
         - reason: 变更原因（必填）。
         - add_tags: 需要新增的印象标签列表。例如 ["爱玩原神", "很幽默"]。
         - remove_tags: 需要移除的旧标签列表（用于修正印象或删除错误的标签）。例如 ["内向"]。
@@ -716,30 +728,45 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             relation = result.scalar_one_or_none()
 
             if not relation:
-                relation = UserRelation(user_id=user_id, user_name=user_name or "", favorability=0, tags=[])
+                relation = UserRelation(
+                    user_id=user_id,
+                    user_name=user_name or "",
+                    favorability=0,
+                    favorability_raw=0,
+                    state="normal",
+                    tags=[],
+                    last_interact_at=datetime.datetime.now(),
+                )
                 db_session.add(relation)
 
             # 2. 处理好感度
             old_score = relation.favorability
-
-            final_change = score_change
-
-            # 【救赎机制】：当好感度低于 -60 且 试图加分时，效果翻倍并额外奖励
-            if old_score < -60 and score_change > 0:
-                final_change = int(score_change * 1.5) + 5
-                logger.info(f"触发救赎机制：原始分 {score_change} -> 修正分 {final_change}")
-
-            # 【破防机制】：当好感度高于 80 且 试图扣分时，伤害加深 (可选)
-            elif old_score > 80 and score_change < 0:
-                final_change = int(score_change * 1.2) - 2
-                logger.info(f"触发破防机制：原始分 {score_change} -> 修正分 {final_change}")
-
-            relation.favorability += final_change
-            relation.favorability = max(-100, min(100, relation.favorability))
-            if score_change > 0:
-                pass
-            elif score_change < 0:
-                pass
+            transition = apply_monika_favorability_change(
+                old_score=old_score,
+                old_raw=relation.favorability_raw,
+                requested_change=score_change,
+                reason=reason,
+                now=datetime.datetime.now(),
+                daily_gain_used=relation.daily_gain_used,
+                daily_bypass_used=relation.daily_bypass_used,
+                daily_gain_bank=relation.daily_gain_bank,
+                daily_cap=relation.daily_cap,
+                cap_reset_at=relation.cap_reset_at,
+                apology_counts=relation.apology_counts,
+                last_penalty_at=relation.last_penalty_at,
+            )
+            relation.favorability = transition.new_score
+            relation.favorability_raw = transition.new_raw
+            relation.state = transition.state_after
+            relation.daily_gain_used = transition.daily_gain_used_after
+            relation.daily_bypass_used = transition.daily_bypass_used_after
+            relation.daily_gain_bank = transition.daily_gain_bank_after
+            relation.daily_cap = transition.daily_cap_after
+            relation.cap_reset_at = transition.cap_reset_at_after
+            relation.apology_counts = transition.apology_counts_after
+            relation.last_interact_at = transition.last_interact_at
+            if transition.applied_change_raw < 0:
+                relation.last_penalty_at = transition.last_interact_at
             # 3. 处理标签 (核心修改)
             # 获取现有标签的副本
             current_tags = list(relation.tags) if relation.tags else []
@@ -770,7 +797,15 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             if add_tags or remove_tags:
                 tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
 
-            log_msg = f"好感度 {old_score}->{favorability}{tag_msg} (原因: {reason})"
+            meta = (
+                f"请求变化 {transition.requested_change:+d}, 应用变化 {transition.applied_change:+d}, "
+                f"状态 {transition.state_before}->{transition.state_after}, "
+                f"cap {transition.daily_gain_used_after:.1f}/{transition.daily_cap_after:.1f}, "
+                f"bypass {transition.daily_bypass_used_after:.1f}, bank {transition.daily_gain_bank_after:.1f}"
+            )
+            if transition.notes:
+                meta += f", 规则 {','.join(transition.notes)}"
+            log_msg = f"好感度 {old_score}->{favorability}{tag_msg} ({meta}) (原因: {reason})"
             logger.info(f"用户[{user_name}]画像更新: {log_msg}")
 
             return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
@@ -803,13 +838,14 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
             return f"""
 【人际关系】
 当前对象：{user_name}
-状态：陌生人 (好感度 0)
+状态：normal (陌生/普通)
+分值：映射分 0 / 原始分 0
 印象：无
 策略：保持礼貌，通过对话了解对方。
 """
-        if relation.favorability <= -80:
+        if relation.state in {"broken", "distressed"}:
             strategy = "策略：你非常讨厌他，但如果他**诚恳道歉**或**做出实质性补偿**，请给他一个改过自新的机会（给予大幅好感度加分），不要一直死咬着不放。"
-        elif relation.favorability >= 90:
+        elif relation.state in {"enamored", "love"}:
             strategy = "策略：你们关系极好，但不要对他无底线纵容。"
         else:
             strategy = ""
@@ -817,14 +853,15 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return f"""
 【人际关系档案】
 当前对象：{relation.user_name}
-当前好感度：{relation.favorability} ({relation.get_status_desc()})
+当前关系状态：{relation.state} ({relation.get_status_desc()})
+当前分值：映射分 {relation.favorability} / 原始分 {relation.favorability_raw}
 当前印象标签：{str(relation.tags)}
 
 【画像维护指南】
 1. 如果对方的表现符合现有标签，无需操作。
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
-4. **关于好感度评分**：请基于**本次对话内容的质量**评分。即使当前好感度是-100，如果用户这次说了让你很开心的话，也必须给出正向分（例如 +10），不要受过去分数影响而吝啬给分。
+4. **关于好感度评分**：请基于**本次对话内容质量**给出 `score_change`（这是意图变化，不是最终变化）。常规用小幅分值（如 -8~+8），明显事件可中幅（-15~+15），只有极端事件才给到 ±30。即使当前关系很差，只要这次表现好，也应给正向分。
 {strategy}
 """
     except Exception as e:
