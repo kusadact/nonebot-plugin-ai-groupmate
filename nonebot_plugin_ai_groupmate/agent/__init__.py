@@ -108,7 +108,17 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
             logger.error(f"RAG skipped (Milvus unavailable): {e}")
             return '未找到相关历史记录'
 
-        similar_msgs = await asyncio.wait_for(MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"'), timeout=8.0)
+        search_res = await asyncio.wait_for(
+            MilvusOP.search(
+                [query],
+                search_filter=f'session_id == "{runtime.context.session_id}"',
+                with_meta=True,
+            ),
+            timeout=8.0,
+        )
+        similar_msgs = search_res.get("texts", []) if isinstance(search_res, dict) else (search_res or [])
+        vector_ids = search_res.get("vector_ids", []) if isinstance(search_res, dict) else []
+        logger.info(f"RAG 搜索命中向量ID session_id={runtime.context.session_id} vector_ids={vector_ids}")
         return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
 
     except asyncio.TimeoutError:

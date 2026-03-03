@@ -450,6 +450,7 @@ class MilvusOperator:
         text: list[str],
         search_filter: str | None = None,
         collection_name="chat_collection",
+        with_meta: bool = False,
     ):
         if not self.initialized:
             await self.init_models()
@@ -493,6 +494,8 @@ class MilvusOperator:
 
         # 快速检查结果，避免后续空列表报错
         if not res or not res[0]:
+            if with_meta:
+                return {"texts": [], "vector_ids": []}
             return None
 
         ids = [i["id"] for i in res[0]]
@@ -508,12 +511,16 @@ class MilvusOperator:
                 results = await asyncio.to_thread(self.bge_rf, text[0], text_list)
 
         if not results:
+            if with_meta:
+                return {"texts": [], "vector_ids": ids}
             return None
 
         if self.remote_client:
             best_texts = [i["text"] for i in results]
         else:
             best_texts = [i.text for i in results]
+        if with_meta:
+            return {"texts": best_texts, "vector_ids": ids}
         return best_texts
 
     async def search_media(self, text):
