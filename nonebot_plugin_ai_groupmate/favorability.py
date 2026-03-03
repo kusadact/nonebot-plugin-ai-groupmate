@@ -11,12 +11,13 @@ MAX_RAW_FAVORABILITY = 1000
 MIN_FAVORABILITY = MIN_RAW_FAVORABILITY // RAW_PER_SCORE
 MAX_FAVORABILITY = MAX_RAW_FAVORABILITY // RAW_PER_SCORE
 
-MAX_DELTA_PER_TURN_SCORE = 30
-DEFAULT_DAILY_CAP = 7.0
-DEFAULT_DAILY_BYPASS_LIMIT = 10.0
-DEFAULT_BANK_LIMIT = 70.0
+MAX_DELTA_PER_TURN_RAW = 50
+# 以下日限额均使用 raw 单位，显示分可用 / RAW_PER_SCORE 换算
+DEFAULT_DAILY_CAP = 70.0
+DEFAULT_DAILY_BYPASS_LIMIT = 100.0
+DEFAULT_BANK_LIMIT = 200.0
 PENALTY_COOLDOWN_SECONDS = 1800
-MIN_PENALTY_COOLDOWN_FACTOR = 0.25
+PENALTY_COOLDOWN_STEP_SECONDS = 300
 
 _APOLOGY_PATTERN = re.compile(r"(道歉|认错|抱歉|对不起|补偿)", re.IGNORECASE)
 _BYPASS_PATTERN = re.compile(r"(生日|周年|纪念|节日|跨年|新年|圣诞|补偿|活动奖励|大事件|#bypass)", re.IGNORECASE)
@@ -36,6 +37,8 @@ class FavorabilityTransition:
     state_after: str
     daily_gain_used_before: float
     daily_gain_used_after: float
+    daily_loss_used_before: float
+    daily_loss_used_after: float
     daily_bypass_used_before: float
     daily_bypass_used_after: float
     daily_gain_bank_before: float
@@ -177,24 +180,27 @@ def _normalize_daily(
     now: datetime,
     cap_reset_at: datetime | None,
     daily_gain_used: float | None,
+    daily_loss_used: float | None,
     daily_bypass_used: float | None,
     daily_cap: float | None,
     notes: list[str],
-) -> tuple[float, float, float, datetime]:
+) -> tuple[float, float, float, float, datetime]:
     cap_input = _safe_float(daily_cap, DEFAULT_DAILY_CAP)
     cap = cap_input if cap_input > 0 else DEFAULT_DAILY_CAP
     gain_used = max(0.0, _safe_float(daily_gain_used))
+    loss_used = max(0.0, _safe_float(daily_loss_used))
     bypass_used = max(0.0, _safe_float(daily_bypass_used))
     reset_at = cap_reset_at or now
 
     if reset_at.date() != now.date():
         gain_used = 0.0
+        loss_used = 0.0
         bypass_used = 0.0
         cap = DEFAULT_DAILY_CAP
         reset_at = now
         notes.append("daily_reset")
 
-    return gain_used, bypass_used, cap, reset_at
+    return gain_used, loss_used, bypass_used, cap, reset_at
 
 
 def apply_monika_favorability_change(
@@ -205,6 +211,7 @@ def apply_monika_favorability_change(
     reason: str,
     now: datetime,
     daily_gain_used: float | None,
+    daily_loss_used: float | None,
     daily_bypass_used: float | None,
     daily_gain_bank: float | None,
     daily_cap: float | None,
@@ -214,33 +221,34 @@ def apply_monika_favorability_change(
 ) -> FavorabilityTransition:
     base_raw = clamp_raw_favorability(old_raw if old_raw is not None else score_to_raw(old_score))
     base_score = raw_to_score(base_raw)
-    req_score = int(requested_change)
+    req_raw = int(requested_change)
 
     notes: list[str] = []
     counts_before = dict(apology_counts or {})
     counts_after = counts_before
 
-    gain_used, bypass_used, cap_value, reset_at = _normalize_daily(
+    gain_used, loss_used, bypass_used, cap_value, reset_at = _normalize_daily(
         now=now,
         cap_reset_at=cap_reset_at,
         daily_gain_used=daily_gain_used,
+        daily_loss_used=daily_loss_used,
         daily_bypass_used=daily_bypass_used,
         daily_cap=daily_cap,
         notes=notes,
     )
     bank_value = max(0.0, _safe_float(daily_gain_bank))
 
-    if req_score > MAX_DELTA_PER_TURN_SCORE:
-        req_score = MAX_DELTA_PER_TURN_SCORE
+    if req_raw > MAX_DELTA_PER_TURN_RAW:
+        req_raw = MAX_DELTA_PER_TURN_RAW
         notes.append("delta_capped_positive")
-    elif req_score < -MAX_DELTA_PER_TURN_SCORE:
-        req_score = -MAX_DELTA_PER_TURN_SCORE
+    elif req_raw < -MAX_DELTA_PER_TURN_RAW:
+        req_raw = -MAX_DELTA_PER_TURN_RAW
         notes.append("delta_capped_negative")
 
-    req_raw = req_score * RAW_PER_SCORE
+    req_score = int(round(req_raw / RAW_PER_SCORE))
     state_before = get_favorability_state(base_raw)
 
-    if req_score == 0:
+    if req_raw == 0:
         return FavorabilityTransition(
             old_score=base_score,
             old_raw=base_raw,
@@ -254,6 +262,8 @@ def apply_monika_favorability_change(
             state_after=state_before,
             daily_gain_used_before=gain_used,
             daily_gain_used_after=gain_used,
+            daily_loss_used_before=loss_used,
+            daily_loss_used_after=loss_used,
             daily_bypass_used_before=bypass_used,
             daily_bypass_used_after=bypass_used,
             daily_gain_bank_before=bank_value,
@@ -266,7 +276,7 @@ def apply_monika_favorability_change(
             notes=tuple(notes),
         )
 
-    if req_score > 0:
+    if req_raw > 0:
         headroom_raw = MAX_RAW_FAVORABILITY - base_raw
         saturation = max(0.20, min(1.0, headroom_raw / (55 * RAW_PER_SCORE)))
         proposed_raw = req_raw * _GAIN_MULTIPLIER[state_before] * saturation
@@ -275,14 +285,14 @@ def apply_monika_favorability_change(
             notes.append("redemption_bonus")
         proposed_raw, counts_after = _apply_apology_diminishing(proposed_raw, reason, counts_before, notes)
 
-        change_score = max(0.0, proposed_raw / RAW_PER_SCORE)
+        change_raw_value = max(0.0, proposed_raw)
         if _reason_is_bypass(reason):
             bypass_avail = max(0.0, DEFAULT_DAILY_BYPASS_LIMIT - bypass_used)
-            bypass_gain = min(change_score, bypass_avail)
-            overflow = max(0.0, change_score - bypass_gain)
+            bypass_gain = min(change_raw_value, bypass_avail)
+            overflow = max(0.0, change_raw_value - bypass_gain)
             bank_avail = max(0.0, DEFAULT_BANK_LIMIT - bank_value)
             bank_add = min(overflow, bank_avail)
-            change_score = bypass_gain
+            change_raw_value = bypass_gain
             bypass_used += bypass_gain
             bank_value += bank_add
             if overflow > 0:
@@ -293,12 +303,12 @@ def apply_monika_favorability_change(
                 notes.append("bypass_gain")
         else:
             gain_avail = max(0.0, cap_value - gain_used)
-            if change_score > gain_avail:
+            if change_raw_value > gain_avail:
                 notes.append("daily_cap_limited")
-            change_score = min(change_score, gain_avail)
-            gain_used += change_score
+            change_raw_value = min(change_raw_value, gain_avail)
+            gain_used += change_raw_value
 
-        change_raw = change_score * RAW_PER_SCORE
+        change_raw = change_raw_value
     else:
         floorroom_raw = base_raw - MIN_RAW_FAVORABILITY
         saturation = max(0.20, min(1.0, floorroom_raw / (55 * RAW_PER_SCORE)))
@@ -307,28 +317,36 @@ def apply_monika_favorability_change(
             proposed_raw -= 2 * RAW_PER_SCORE
             notes.append("high_trust_fragile")
 
-        lose_score = max(0.0, -proposed_raw / RAW_PER_SCORE)
+        lose_raw = max(0.0, -proposed_raw)
         if last_penalty_at is not None:
             elapsed = (now - last_penalty_at).total_seconds()
             if elapsed < PENALTY_COOLDOWN_SECONDS:
-                ratio = max(0.0, elapsed / PENALTY_COOLDOWN_SECONDS)
-                cooldown_factor = max(MIN_PENALTY_COOLDOWN_FACTOR, ratio)
-                lose_score *= cooldown_factor
-                notes.append(f"penalty_cooldown({int(elapsed)}s)")
+                elapsed = max(0.0, elapsed)
+                max_steps = max(1, PENALTY_COOLDOWN_SECONDS // PENALTY_COOLDOWN_STEP_SECONDS)
+                step_idx = int(elapsed // PENALTY_COOLDOWN_STEP_SECONDS)
+                cooldown_factor = min(1.0, step_idx / max_steps)
+                lose_raw *= cooldown_factor
+                notes.append(f"penalty_cooldown_step({step_idx}/{max_steps})")
         if bank_value > 0:
-            base_lose = lose_score * 0.4
-            bank_lose = lose_score - base_lose
+            base_lose = lose_raw * 0.4
+            bank_lose = lose_raw - base_lose
             if bank_value < bank_lose:
                 bank_lose = bank_value
-                base_lose = lose_score - bank_lose
+                base_lose = lose_raw - bank_lose
             else:
                 bank_lose = min(bank_lose * 1.25, bank_value)
-            lose_score = base_lose + bank_lose
+            lose_raw = base_lose + bank_lose
             bank_value -= bank_lose
             if bank_lose > 0:
                 notes.append("bank_penalty")
 
-        change_raw = -lose_score * RAW_PER_SCORE
+        loss_avail = max(0.0, cap_value - loss_used)
+        if lose_raw > loss_avail:
+            notes.append("daily_loss_cap_limited")
+        lose_raw = min(lose_raw, loss_avail)
+        loss_used += lose_raw
+
+        change_raw = -lose_raw
 
     applied_raw = int(round(change_raw))
     if req_raw > 0 and applied_raw <= 0 and change_raw > 0:
@@ -358,6 +376,8 @@ def apply_monika_favorability_change(
         state_after=state_after,
         daily_gain_used_before=max(0.0, _safe_float(daily_gain_used)),
         daily_gain_used_after=gain_used,
+        daily_loss_used_before=max(0.0, _safe_float(daily_loss_used)),
+        daily_loss_used_after=loss_used,
         daily_bypass_used_before=max(0.0, _safe_float(daily_bypass_used)),
         daily_bypass_used_after=bypass_used,
         daily_gain_bank_before=max(0.0, _safe_float(daily_gain_bank)),
@@ -380,9 +400,10 @@ def apply_favorability_change(old_score: int, requested_change: int) -> Favorabi
         reason="",
         now=now,
         daily_gain_used=0.0,
+        daily_loss_used=0.0,
         daily_bypass_used=0.0,
         daily_gain_bank=0.0,
-        daily_cap=999.0,
+        daily_cap=9990.0,
         cap_reset_at=now,
         apology_counts={},
     )

@@ -642,7 +642,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
         当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
 
         参数:
-        - score_change: 好感度意图变化值（正数加分，负数扣分）。常规建议 -8~+8，明显事件可用 -15~+15，极端上限 -30~+30；最终实际变化会被状态、日上限、bank、道歉衰减等规则二次调整。
+        - score_change: 好感度意图变化值（raw 单位，正数加分，负数扣分）。常规建议 -20~+20，极端上限 -50~+50；最终实际变化会被状态、日上限、bank、道歉衰减等规则二次调整。
         - reason: 变更原因（必填）。
         - add_tags: 需要新增的印象标签列表。例如 ["爱玩原神", "很幽默"]。
         - remove_tags: 需要移除的旧标签列表（用于修正印象或删除错误的标签）。例如 ["内向"]。
@@ -676,6 +676,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
                 reason=reason,
                 now=datetime.datetime.now(),
                 daily_gain_used=relation.daily_gain_used,
+                daily_loss_used=relation.daily_loss_used,
                 daily_bypass_used=relation.daily_bypass_used,
                 daily_gain_bank=relation.daily_gain_bank,
                 daily_cap=relation.daily_cap,
@@ -687,6 +688,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             relation.favorability_raw = transition.new_raw
             relation.state = transition.state_after
             relation.daily_gain_used = transition.daily_gain_used_after
+            relation.daily_loss_used = transition.daily_loss_used_after
             relation.daily_bypass_used = transition.daily_bypass_used_after
             relation.daily_gain_bank = transition.daily_gain_bank_after
             relation.daily_cap = transition.daily_cap_after
@@ -726,9 +728,11 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
                 tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
 
             meta = (
-                f"请求变化 {transition.requested_change:+d}, 应用变化 {transition.applied_change:+d}, "
+                f"请求变化 raw {transition.requested_change_raw:+d} (映射 {transition.requested_change:+d}), "
+                f"应用变化 raw {transition.applied_change_raw:+d} (映射 {transition.applied_change:+d}), "
                 f"状态 {transition.state_before}->{transition.state_after}, "
-                f"cap {transition.daily_gain_used_after:.1f}/{transition.daily_cap_after:.1f}, "
+                f"gain_cap {transition.daily_gain_used_after:.1f}/{transition.daily_cap_after:.1f}, "
+                f"loss_cap {transition.daily_loss_used_after:.1f}/{transition.daily_cap_after:.1f}, "
                 f"bypass {transition.daily_bypass_used_after:.1f}, bank {transition.daily_gain_bank_after:.1f}"
             )
             if transition.notes:
@@ -736,7 +740,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             log_msg = f"好感度 {old_score}->{favorability}{tag_msg} ({meta}) (原因: {reason})"
             logger.info(f"用户[{user_name}]画像更新: {log_msg}")
 
-            return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+            return f"画像已更新。当前好感度(映射/原始): {favorability}/{relation.favorability_raw}，当前标签: {current_tags}"
 
         except Exception as e:
             logger.error(f"关系更新失败: {e}")
@@ -789,7 +793,7 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
 1. 如果对方的表现符合现有标签，无需操作。
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
-4. **关于好感度评分**：请基于**本次对话内容质量**给出 `score_change`（这是意图变化，不是最终变化）。常规用小幅分值（如 -8~+8），明显事件可中幅（-15~+15），只有极端事件才给到 ±30。即使当前关系很差，只要这次表现好，也应给正向分。
+4. **关于好感度评分**：请基于**本次对话内容质量**给出 `score_change`（这是 raw 意图变化，不是最终变化）。常规用小幅分值（如 -20~+20），只有极端事件才给到 ±50。即使当前关系很差，只要这次表现好，也应给正向分。
 {strategy}
 """
     except Exception as e:

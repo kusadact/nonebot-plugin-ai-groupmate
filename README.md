@@ -31,11 +31,13 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 - 好感度系统 V2（Monika 风格）：
   - 新关系表：`nonebot_plugin_ai_groupmate_userrelation_v2`（旧表保留但不再作为主逻辑写入）。
   - 双分值模型：`favorability_raw` 为主驱动（范围 `[-1000, 1000]`），`favorability` 为映射显示分（范围 `[-100, 100]`，`RAW_PER_SCORE=10`）。
+  - Agent 打分口径改为 raw：`update_user_impression.score_change` 按 raw 传入，常规建议 `±20`，单次硬上限 `±50`。
   - 状态机：`broken / distressed / upset / normal / happy / affectionate / enamored / love`，按 raw 分段决定关系描述与系数。
   - 正负向非线性：根据当前状态对加分/扣分使用不同倍率，并在接近上下限时自动“饱和”衰减。
-  - 日限制机制：普通正向受 `daily_cap`（默认 7）限制；`bypass` 通道有单独上限（默认 10），溢出进入 `daily_gain_bank`（默认上限 70）。
+  - 日限制机制（raw 单位）：每日普通正向最多 `+70`（映射 `+7`），每日普通负向最多 `-70`（映射 `-7`）。
+  - bypass/bank（raw 单位）：`bypass` 每日上限 `100`（映射 `+10`），`bank` 存储上限 `200`（映射 `+20`）。
   - 道歉衰减：同类型道歉加分按“第一次全额、第二次半额、第三次及以后衰减至 0”处理。
-  - 惩罚冷却（`last_penalty_at` 已接入）：连续负向变更会按上次惩罚时间衰减，冷却窗口 30 分钟（1800 秒），窗口内最小惩罚系数 0.25。
+  - 惩罚冷却（`last_penalty_at` 已接入）：连续负向变更按 5 分钟一档做阶梯衰减（0/1/2/3/4/5/6 档），冷却窗口 30 分钟（1800 秒）；超过 30 分钟后不再衰减。
 
 ## ⚙️ 配置
 
