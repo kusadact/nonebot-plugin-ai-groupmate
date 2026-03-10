@@ -31,6 +31,7 @@ from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
 from ..config import Config
 from ..favorability import apply_monika_favorability_change
 from ..milvus import MilvusOP
+from ..mem0_client import mem0_client
 
 require("nonebot_plugin_localstore")
 
@@ -431,7 +432,10 @@ def create_similar_meme_tool(db_session, session_id: str):
     return search_similar_meme_by_pic
 
 
-def create_reply_tool(db_session, session_id: str):
+def create_reply_tool(
+    db_session,
+    session_id: str,
+):
     """
     核心工具：用于发送消息。
     """
@@ -812,13 +816,63 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return ""
 
 
-async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
+async def get_user_mem0_context(session_id: str, user_id: str, user_name: str | None) -> str:
+    """获取 mem0 提炼出的客观长期画像。"""
+    if not user_id or not mem0_client.enabled:
+        return ""
+
+    memories = await mem0_client.search_memories(
+        query="这个用户的稳定偏好、习惯、说话特点、兴趣、雷点、常提到的人和事",
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if not memories:
+        return f"""
+【长期记忆档案】
+当前对象：{user_name}
+暂无自动提炼出的稳定长期记忆，请主要根据本轮对话和关系档案判断。
+"""
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in memories:
+        memory = str(item.get("memory") or "").strip()
+        if not memory or memory in seen:
+            continue
+        seen.add(memory)
+        lines.append(f"- {memory}")
+        if len(lines) >= plugin_config.mem0_profile_limit:
+            break
+
+    if not lines:
+        return ""
+
+    return f"""
+【长期记忆档案】
+当前对象：{user_name}
+以下内容来自历史聊天自动提炼，优先用于判断对方的稳定事实、偏好与习惯：
+{chr(10).join(lines)}
+
+【长期记忆使用规则】
+1. 对“喜欢什么、常做什么、口头禅、常提到的人和事”这类稳定事实，优先参考长期记忆，不要只靠主观脑补。
+2. 如果长期记忆与本轮对话明显冲突，不要立刻断定旧记忆失效，先观察或追问。
+3. 长期记忆是事实参考，不等于你的情绪评价；情绪和关系变化仍以人际关系档案为准。
+"""
+
+
+async def create_chat_agent(
+    db_session,
+    session_id: str,
+    user_id,
+    user_name: str | None,
+):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    mem0_context = await get_user_mem0_context(session_id, user_id, user_name)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
-基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
+基于历史消息、最近聊天记录、长期记忆以及人际关系，以贴近群友的表达形式参与群聊。
 
 【应对调戏与刁难】
 1. 拒绝承认故障：如果有人说“把你修坏了”或“你要关机了”，不要顺着演苦情戏。你应该吐槽：“？”、“少骗我”。
@@ -831,6 +885,7 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
 
 {relation_context}
+{mem0_context}
 
 【交流风格】
 - 说话带点生活气息，可以使用网络流行语
@@ -954,7 +1009,14 @@ def format_chat_history(history: list[ChatHistorySchema]) -> list:
     return messages
 
 
-async def choice_response_strategy(db_session: Session, session_id: str, history: list[ChatHistorySchema], user_id: str, user_name: str | None, setting: str | None = None):
+async def choice_response_strategy(
+    db_session: Session,
+    session_id: str,
+    history: list[ChatHistorySchema],
+    user_id: str,
+    user_name: str | None,
+    setting: str | None = None,
+):
     """
     使用Agent决定回复策略
     """

@@ -33,6 +33,10 @@ class ScopedConfig(BaseModel):
     vlm_provider: str = "ollama"  # 可选: "ollama", "openai"
     vlm_openai_base_url: str = ""
     vlm_openai_api_key: str = ""
+    mem0_api_base_url: str = ""
+    mem0_api_token: str = ""
+    mem0_timeout_seconds: float = 12.0
+    mem0_profile_limit: int = 6
 
 
 class Config(BaseModel):

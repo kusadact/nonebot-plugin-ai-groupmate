@@ -65,6 +65,10 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__openai_base_url | 否 | 无| openai 请求地址 |
 | ai_groupmate__openai_token | 否 | 无 | openai token |
 | ai_groupmate__openai_model | 否 | 无 | openai 模型名 |
+| ai_groupmate__mem0_api_base_url | 否 | 无 | mem0 API 地址 |
+| ai_groupmate__mem0_api_token | 否 | 无 | mem0 API Bearer Token |
+| ai_groupmate__mem0_timeout_seconds | 否 | 12.0 | mem0 请求超时秒数 |
+| ai_groupmate__mem0_profile_limit | 否 | 6 | prompt 中注入的长期记忆条数上限 |
 | ai_groupmate__vlm_ollama_base_url | 否 | 无| vlm 地址 |
 | ai_groupmate__vlm_model | 否 | 无 | vlm 模型名 |
 | ai_groupmate__vlm_provider | 否 | ollama| ollama 或 openai |
@@ -99,6 +103,67 @@ ai_groupmate__remote_rerank_model=BAAI/bge-reranker-v2-m3
 ai_groupmate__remote_clip_base_url=http://127.0.0.1:18001
 ai_groupmate__remote_clip_api_key=
 ```
+
+### mem0 API 接入示例
+说明：mem0 用于“用户长期画像/偏好”提炼，不替代当前聊天 RAG。当前同步策略不是把原始消息直接塞进 mem0，而是先按 `session_id` 切 10 分钟群上下文窗口，再针对窗口内的目标用户提炼画像事实，最后只把画像型 memory 写入 mem0。建议使用独立 collection / database。
+
+```env
+ai_groupmate__mem0_api_base_url=http://38.76.207.15:18080
+ai_groupmate__mem0_api_token=replace-with-your-bearer-token
+ai_groupmate__mem0_timeout_seconds=12
+ai_groupmate__mem0_profile_limit=6
+```
+
+### 历史聊天回填到 mem0
+说明：离线脚本现在已经改成“10 分钟上下文窗口 -> 用户画像提炼 -> 写 mem0”的口径。它会按 `session_id` 读取整段群聊时间线，先按 10 分钟断窗，再按消息数和 token 数做二次切分，然后只把提炼后的画像事实写入 mem0。默认不会挑“发言最多的前 N 个用户”，而是直接扫描整个群的时间线；但每个用户在单个 10 分钟时间窗里的有效发言数必须达到阈值，默认 `30` 条，低于阈值则跳过，不写画像。
+
+依赖：
+
+```bash
+python3 -m pip install "psycopg[binary]" langchain-openai pydantic tiktoken
+```
+
+如果你本来就在 bot 的虚拟环境里执行，一般不用额外装。
+
+先做不落库的 dry-run：
+
+```bash
+python3 scripts/backfill_mem0_history.py \
+  --env-file /opt/nekobot/.env.dev \
+  --session-id 1014229978 \
+  --user-id 1030780373 \
+  --dry-run
+```
+
+写入 mem0 但不改 `mem0_synced`：
+
+```bash
+python3 scripts/backfill_mem0_history.py \
+  --env-file /opt/nekobot/.env.dev \
+  --session-id 1014229978 \
+  --user-id 1030780373 \
+  --mem0-base-url http://38.76.207.15:18080 \
+  --mem0-api-token replace-with-your-bearer-token \
+  --no-mark-synced
+```
+
+正式回填：
+
+```bash
+python3 scripts/backfill_mem0_history.py \
+  --env-file /opt/nekobot/.env.dev \
+  --mem0-base-url http://38.76.207.15:18080 \
+  --mem0-api-token replace-with-your-bearer-token
+```
+
+默认保护参数：
+
+- `--max-time-gap-minutes 10`
+- `--max-window-messages 120`
+- `--max-window-tokens 5000`
+- `--min-user-messages-per-window 30`
+
+也就是说，即便群聊 10 分钟内刷了很多消息，脚本也不会把超长窗口整包塞给单次 LLM；而如果某个用户在这个 10 分钟时间窗里发言不到 30 条，也不会写入 mem0 画像。
 
 ## 🎉 使用
 

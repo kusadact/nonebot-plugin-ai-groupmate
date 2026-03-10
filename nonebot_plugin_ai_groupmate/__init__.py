@@ -41,6 +41,8 @@ from .utils import (
 )
 from .config import Config
 from .milvus import MilvusOP
+from .mem0_client import mem0_client
+from .mem0_sync import list_pending_mem0_sessions, process_and_sync_mem0_session_profile
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -691,7 +693,7 @@ async def handle_reply_logic(
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
         try:
-            await asyncio.wait_for(choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, ""),timeout=120.0)
+            await asyncio.wait_for(choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, ""), timeout=120.0)
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时，跳过回复 - session: {session.scene.id}")
             return
@@ -836,6 +838,35 @@ async def vectorize_media():
 
         await db_session.commit()
         logger.info("向量化媒体完成")
+
+
+@scheduler.scheduled_job("interval", minutes=25, max_instances=1, coalesce=True, id="sync_mem0_profile")
+async def sync_mem0_profile():
+    if not _is_enabled() or not mem0_client.enabled:
+        return
+
+    async with get_session() as db_session:
+        pending_sessions = await list_pending_mem0_sessions(db_session)
+        if not pending_sessions:
+            logger.info("没有待同步到 mem0 的聊天记录")
+            return
+
+        logger.info(f"待同步 mem0 session 数量: {len(pending_sessions)}")
+        for session_id in pending_sessions:
+            try:
+                res = await process_and_sync_mem0_session_profile(db_session, session_id)
+                if res:
+                    logger.info(
+                        f"mem0 同步完成 session_id={res['session_id']} "
+                        f"windows={res['processed_windows']} synced_users={res['synced_users']} "
+                        f"messages={res['synced_messages']} facts={res['written_facts']}"
+                    )
+                else:
+                    logger.info(f"mem0: session_id={session_id} 无需同步")
+            except Exception as e:
+                logger.error(f"mem0 同步失败 session_id={session_id}: {e}")
+                await db_session.rollback()
+                continue
 
 
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")

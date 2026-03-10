@@ -41,6 +41,7 @@ class ChatHistory(Model):
     user_name: Mapped[str]
     media_id: Mapped[int | None]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    mem0_synced: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class UserRelation(Model):
@@ -82,6 +83,7 @@ class ChatHistorySchema(BaseModel):
     user_name: str
     media_id: int | None = None
     vectorized: bool | None = False
+    mem0_synced: bool | None = False
 
     class Config:
         from_attributes = True  # ✅ 允许从 ORM 对象创建

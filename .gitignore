@@ -5,3 +5,7 @@ __pycache__/
 # macOS metadata
 .DS_Store
 ._*
+
+# Local deployment secrets / data
+mem0_api/.env
+mem0_api/data/
