@@ -616,7 +616,12 @@ async def process_image_message(
             db_session.add(existing_media)
         else:
             # 新图片，调用VLM获取描述
-            image_description = await image_vl(file_path)
+            image_description = await image_vl(
+                file_path,
+                VLM_SHORT_PROMPT,
+                VLM_SHORT_MAX_TOKENS,
+                VLM_SHORT_TIMEOUT,
+            )
 
             if image_description:
                 media_storage = MediaStorage(
@@ -814,14 +819,35 @@ async def vectorize_media():
                     continue
 
                 # 判断是否适合作为表情包
-                vlm_res = await image_vl(file_path, "请判断这张图适不适合作为表情包，只回答是或否")
+                vlm_res = await image_vl(
+                    file_path,
+                    "请判断这张图适不适合作为表情包，只回答是或否",
+                    VLM_SHORT_MAX_TOKENS,
+                    VLM_SHORT_TIMEOUT,
+                )
                 if not vlm_res or vlm_res != "是":
                     media.vectorized = True
                     db_session.add(media)
                     continue
 
+                # If suitable, refresh a long description for better media search/rerank
+                long_desc = await image_vl(
+                    file_path,
+                    VLM_LONG_PROMPT,
+                    VLM_LONG_MAX_TOKENS,
+                    VLM_LONG_TIMEOUT,
+                )
+                if long_desc:
+                    media.description = long_desc
+                    db_session.add(media)
+
                 try:
-                    await MilvusOP.insert_media(media.media_id, [str(file_path)])
+                    await MilvusOP.insert_media(
+                        media.media_id,
+                        [str(file_path)],
+                        description=media.description or "",
+                        file_path=str(file_path),
+                    )
                     media.vectorized = True
                     db_session.add(media)
                     logger.info("向量化成功")
@@ -868,3 +894,10 @@ async def clear_cache_pic():
 
         await db_session.commit()
         logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
+# VLM short/long description tuning
+VLM_SHORT_PROMPT = "请用一句话简短描述这张图，不超过30字"
+VLM_SHORT_MAX_TOKENS = 128
+VLM_SHORT_TIMEOUT = 30.0
+VLM_LONG_PROMPT = "请描述一下这个图片"
+VLM_LONG_MAX_TOKENS = 1024
+VLM_LONG_TIMEOUT = 120.0

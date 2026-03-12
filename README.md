@@ -11,13 +11,16 @@
 
 tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学习群内群友发言习惯，使得 bot 更像真人。
 
-对于群内的表情包，使用了 vlm + clip 模型，自动从群内学习并偷取表情包，然后从向量库内选取合适表情包进行回答。
+对于群内的表情包，使用了 vlm + 多模态 embedding / rerank 模型，自动从群内学习并偷取表情包，然后从向量库内选取合适表情包进行回答。
 
-对于模型选择方面：推荐使用 glm-4.6 模型，以及本地部署 qwen3-vl 作为 vlm 模型，如果 embedding、 rerank、vlm 和 clip 模型都使用了显卡加速的话，大约需要 16G 显存的显卡。若只有 8G 显存，将 vlm 模型调整为 api 调用的话，就可以流畅使用了。
+对于模型选择方面：推荐使用 glm-4.6 模型，以及本地部署 qwen3-vl 作为 vlm 模型。如果 embedding、rerank、vlm 和多模态 embedding / rerank 模型都使用显卡加速，大约需要 16G 显存；若只有 8G 显存，将 vlm 模型调整为 API 调用会更稳妥。
 
 ## 改动说明
-- 将 embedding / rerank / clip 等模型计算远程化：插件只负责业务逻辑，模型端使用 `server/app.py` 部署（默认监听 `8001`，可通过隧道/FRP 映射到 `18001`等端口）。
-- 图片向量化支持 base64 传输（`/clip/image` 的 `images_base64`）。
+- 将 embedding / rerank / media embedding / media rerank 等模型计算远程化：插件只负责业务逻辑。旧版 CLIP 服务仍可使用 `server/app.py` / `server/app_server.py`。图片 embedding 现已支持两种接法：
+  - OpenAI 风格 `/v1/embeddings`
+  - 阿里百炼原生多模态 embedding 接口 `qwen3-vl-embedding`
+- 图片向量化与图片 rerank 使用 OpenAI 风格接口，插件侧会请求 `base_url + /embeddings` 与 `base_url + /rerank`，图片以 base64 data URL 传输。
+- 文本与图片向量库默认维度调整为 `2048`；升级后需要重建现有 Milvus `chat_collection` / `media_collection`。
 - 新增 superuser 手动开关指令：`/ai on|off|status`
   - `off` 仅停止 AI 回复与向量库查询/写入；VLM 识别与聊天记录入库不受影响。
   - `status` 会实际请求 Milvus，并区分 `down (tunnel:...)` 与 `down (milvus:...)`。
@@ -48,19 +51,28 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__reply_probability | 否 | 0.01 | 群内发言概率 |
 | ai_groupmate__personality_setting | 否 | 无 | 自定义人设 |
 | ai_groupmate__milvus_uri | 否 | 无 | milvus 地址 |
+| ai_groupmate__milvus_db_name | 否 | ai_groupmate | Milvus 数据库名（远程 Milvus/Zilliz 生效；Lite `.db` 模式忽略） |
 | ai_groupmate__milvus_user | 否 | 无| milvus 用户名 |
 | ai_groupmate__milvus_password | 否 | 无 | milvus 密码 |
-| ai_groupmate__remote_model_base_url | 否 | 无 | 远程模型服务地址（/embed /rerank /clip） |
+| ai_groupmate__chat_vector_dim | 否 | 2048 | 聊天文本向量维度 |
+| ai_groupmate__media_vector_dim | 否 | 2048 | 图片向量维度 |
+| ai_groupmate__remote_model_base_url | 否 | 无 | 旧版统一模型服务地址（`/embed` / `/rerank`） |
 | ai_groupmate__remote_model_api_key | 否 | 无 | 远程模型服务 API Key |
 | ai_groupmate__remote_embedding_base_url | 否 | 无 | embedding 分路地址（硅基流动/OpenAI 风格） |
 | ai_groupmate__remote_embedding_api_key | 否 | 无 | embedding 分路 API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_embedding_model | 否 | 无 | embedding 模型名（如 `BAAI/bge-m3`） |
-| ai_groupmate__remote_embedding_dimensions | 否 | 0 | embedding 维度；`0` 表示不传 `dimensions` 字段 |
+| ai_groupmate__remote_embedding_dimensions | 否 | 2048 | 文本 embedding 维度 |
 | ai_groupmate__remote_rerank_base_url | 否 | 无 | rerank 分路地址（硅基流动） |
 | ai_groupmate__remote_rerank_api_key | 否 | 无 | rerank 分路 API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_rerank_model | 否 | 无 | rerank 模型名（如 `BAAI/bge-reranker-v2-m3`） |
-| ai_groupmate__remote_clip_base_url | 否 | 无 | clip 分路地址（本地/远程 clip 服务） |
-| ai_groupmate__remote_clip_api_key | 否 | 无 | clip 分路 API Key（为空则回退用 remote_model_api_key） |
+| ai_groupmate__remote_media_embedding_provider | 否 | openai | 图片 embedding 提供方：`openai` 或 `aliyun_dashscope` |
+| ai_groupmate__remote_media_embedding_base_url | 否 | 无 | 图片 embedding 地址；`openai` 时填 `/v1` 前缀，`aliyun_dashscope` 时填百炼原生多模态 embedding 完整 URL |
+| ai_groupmate__remote_media_embedding_api_key | 否 | 无 | 图片 embedding API Key（为空则回退用 remote_model_api_key） |
+| ai_groupmate__remote_media_embedding_model | 否 | 无 | 图片 embedding 模型名 |
+| ai_groupmate__remote_media_embedding_dimensions | 否 | 2048 | 图片 embedding 维度 |
+| ai_groupmate__remote_media_rerank_base_url | 否 | 无 | 图片 rerank 分路地址（建议直接填带 `/v1` 的 base_url） |
+| ai_groupmate__remote_media_rerank_api_key | 否 | 无 | 图片 rerank API Key（为空则回退用 remote_model_api_key） |
+| ai_groupmate__remote_media_rerank_model | 否 | 无 | 图片 rerank 模型名 |
 | ai_groupmate__tavily_api_key | 否 | 无 | tavily api 密钥 |
 | ai_groupmate__openai_base_url | 否 | 无| openai 请求地址 |
 | ai_groupmate__openai_token | 否 | 无 | openai token |
@@ -79,25 +91,36 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 ```env
 ai_groupmate__remote_model_base_url=http://127.0.0.1:18001
 ai_groupmate__milvus_uri=http://127.0.0.1:19350
+ai_groupmate__milvus_db_name=ai_groupmate
 ```
 
-### embedding/rerank 走硅基流动 + clip 走本地示例
-说明：`remote_embedding_base_url` 与 `remote_rerank_base_url` 请填写 `https://api.siliconflow.cn`（不要再带 `/v1`，代码会自动拼接）。
+### embedding/rerank 走硅基流动 + 图片 embedding 直连阿里百炼示例
+说明：`remote_embedding_base_url` 与 `remote_rerank_base_url` 请直接填写带 `/v1` 的完整前缀，例如 `https://api.siliconflow.cn/v1`。图片 embedding 如果使用阿里百炼，请把 `remote_media_embedding_provider` 设为 `aliyun_dashscope`，并直接填写百炼原生多模态 embedding 完整 URL。
 
 ```env
 ai_groupmate__milvus_uri=http://127.0.0.1:19530
+ai_groupmate__milvus_db_name=ai_groupmate
+ai_groupmate__chat_vector_dim=2048
+ai_groupmate__media_vector_dim=2048
 
-ai_groupmate__remote_embedding_base_url=https://api.siliconflow.cn
+ai_groupmate__remote_embedding_base_url=https://api.siliconflow.cn/v1
 ai_groupmate__remote_embedding_api_key=sk-xxxx
-ai_groupmate__remote_embedding_model=BAAI/bge-m3
-ai_groupmate__remote_embedding_dimensions=0
+ai_groupmate__remote_embedding_model=Qwen/Qwen3-Embedding-4B
+ai_groupmate__remote_embedding_dimensions=2048
 
-ai_groupmate__remote_rerank_base_url=https://api.siliconflow.cn
+ai_groupmate__remote_rerank_base_url=https://api.siliconflow.cn/v1
 ai_groupmate__remote_rerank_api_key=sk-xxxx
-ai_groupmate__remote_rerank_model=BAAI/bge-reranker-v2-m3
+ai_groupmate__remote_rerank_model=Qwen/Qwen3-Reranker-4B
 
-ai_groupmate__remote_clip_base_url=http://127.0.0.1:18001
-ai_groupmate__remote_clip_api_key=
+ai_groupmate__remote_media_embedding_provider=aliyun_dashscope
+ai_groupmate__remote_media_embedding_base_url=https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding
+ai_groupmate__remote_media_embedding_api_key=sk-xxxx
+ai_groupmate__remote_media_embedding_model=qwen3-vl-embedding
+ai_groupmate__remote_media_embedding_dimensions=2048
+
+ai_groupmate__remote_media_rerank_base_url=
+ai_groupmate__remote_media_rerank_api_key=
+ai_groupmate__remote_media_rerank_model=
 ```
 
 ## 🎉 使用

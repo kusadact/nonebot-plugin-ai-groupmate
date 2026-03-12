@@ -114,7 +114,7 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
                 search_filter=f'session_id == "{runtime.context.session_id}"',
                 with_meta=True,
             ),
-            timeout=8.0,
+            timeout=15.0,
         )
         similar_msgs = search_res.get("texts", []) if isinstance(search_res, dict) else (search_res or [])
         vector_ids = search_res.get("vector_ids", []) if isinstance(search_res, dict) else []
