@@ -32,7 +32,7 @@ from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
 from .vlm import image_vl
-from .agent import choice_response_strategy
+from .agent import check_if_should_reply, choice_response_strategy
 from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
@@ -575,7 +575,14 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         user_id = ""
         user_name = ""
     if should_reply:
-        await handle_reply_logic(db_session, session, user_id, user_name)
+        await handle_reply_logic(
+            db_session,
+            session,
+            plugin_config.bot_name,
+            user_id,
+            user_name,
+            to_me,
+        )
 
     await db_session.commit()
 
@@ -673,14 +680,65 @@ async def process_image_message(
         await db_session.rollback()
 
 
+def _clean_gate_text(content: str) -> str:
+    lines = []
+    for raw_line in (content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("id:") or line.startswith("回复id:"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 async def handle_reply_logic(
     db_session,
     session: Uninfo,
+    bot_name: str,
     user_id: str,
     user_name: str | None,
+    is_tome: bool,
 ):
     """处理回复逻辑"""
     try:
+        # 非 @bot / 非明确点名时，先做一次轻量前置判断，避免频繁启动主 Agent。
+        recent_msgs = (
+            await db_session.execute(
+                Select(ChatHistory)
+                .where(ChatHistory.session_id == session.scene.id)
+                .order_by(ChatHistory.msg_id.desc())
+                .limit(3)
+            )
+        ).scalars().all()
+        recent_msgs = recent_msgs[::-1]
+
+        if not recent_msgs:
+            return
+
+        history_summary = ""
+        for msg in recent_msgs:
+            if msg.content_type == "image":
+                history_summary += f"{msg.user_name}: [发送了一张图片]\n"
+            else:
+                history_summary += f"{msg.user_name}: {_clean_gate_text(msg.content)}\n"
+
+        current_msg_text = (
+            _clean_gate_text(recent_msgs[-1].content)
+            if recent_msgs[-1].content_type == "text"
+            else "[图片]"
+        )
+
+        if not is_tome:
+            should_reply = await check_if_should_reply(
+                history_summary,
+                current_msg_text,
+                bot_name,
+            )
+            if not should_reply:
+                logger.debug(f"前置判断拒绝回复 session={session.scene.id}")
+                return
+
         # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
         last_msg = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session.scene.id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(20))).scalars().all()
@@ -897,7 +955,7 @@ async def clear_cache_pic():
 # VLM short/long description tuning
 VLM_SHORT_PROMPT = "请用一句话简短描述这张图，不超过30字"
 VLM_SHORT_MAX_TOKENS = 128
-VLM_SHORT_TIMEOUT = 30.0
+VLM_SHORT_TIMEOUT = 60.0
 VLM_LONG_PROMPT = "请描述一下这个图片"
 VLM_LONG_MAX_TOKENS = 1024
-VLM_LONG_TIMEOUT = 120.0
+VLM_LONG_TIMEOUT = 180.0

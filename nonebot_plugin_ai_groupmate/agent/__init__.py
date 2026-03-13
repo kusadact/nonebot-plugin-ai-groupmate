@@ -24,8 +24,13 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.orm.session import Session
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.agents.structured_output import ToolStrategy
+
+try:
+    from langchain.agents.middleware import ToolCallLimitMiddleware
+except Exception:
+    ToolCallLimitMiddleware = None
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
 from ..config import Config
@@ -72,6 +77,59 @@ class ResponseMessage(BaseModel):
             return None  # 返回 None，Pydantic 将其视为缺失或 null 值
 
         return value
+
+
+reply_gate_model = ChatOpenAI(
+    model=plugin_config.openai_model,
+    api_key=SecretStr(plugin_config.openai_token),
+    base_url=plugin_config.openai_base_url,
+    temperature=0,
+)
+
+
+async def check_if_should_reply(
+    history_summary: str,
+    current_msg: str,
+    bot_name: str,
+) -> bool:
+    """
+    在进入主 Agent 前，快速判断普通群聊消息是否值得回复。
+    """
+    system_prompt = f"""
+你是一个群聊消息过滤器。你的任务是判断群内的最新消息是否需要机器人 "{bot_name}" 进行回复。
+
+判断规则：
+1. 如果用户明显在向 "{bot_name}" 提问、求助、打招呼、点名、追问上下文，返回 YES。
+2. 如果消息只是群友之间的普通闲聊、刷屏、表情、无关内容，返回 NO。
+3. 如果不确定，返回 NO。
+
+请仅输出 YES 或 NO，不要输出任何其他内容。
+"""
+    input_text = (
+        f"【最近上下文】\n{history_summary}\n\n"
+        f"【最新消息】\n{current_msg}\n\n"
+        "请判断是否需要机器人回复："
+    )
+
+    try:
+        resp = await asyncio.wait_for(
+            reply_gate_model.ainvoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=input_text),
+                ]
+            ),
+            timeout=15.0,
+        )
+        content = resp.content if isinstance(resp.content, str) else ""
+        normalized = content.strip().upper().replace(".", "").replace("。", "")
+        return normalized == "YES"
+    except asyncio.TimeoutError:
+        logger.warning("前置判断超时，默认不回复")
+        return False
+    except Exception as e:
+        logger.error(f"前置判断失败: {e}")
+        return False
 
 
 # 如果想封装成自定义的 @tool，可以这样写:
@@ -930,9 +988,33 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             report_tool,
         ]
 
-    agent = create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context)
+    middleware = None
+    if ToolCallLimitMiddleware is not None:
+        try:
+            middleware = [
+                ToolCallLimitMiddleware(run_limit=8),
+                ToolCallLimitMiddleware(tool_name="reply_user", run_limit=1),
+                ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=1),
+            ]
+        except Exception as e:
+            logger.warning(f"当前 LangChain middleware 参数不兼容，跳过工具限流: {e}")
+            middleware = None
 
-    return agent
+    try:
+        if middleware:
+            return create_agent(
+                model,
+                tools=tools,
+                system_prompt=system_prompt,
+                context_schema=Context,
+                middleware=middleware,
+            )
+    except TypeError:
+        logger.warning("当前 LangChain 版本不支持 agent middleware，跳过工具限流")
+    except Exception as e:
+        logger.warning(f"Agent middleware 初始化失败，跳过工具限流: {e}")
+
+    return create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context)
 
 
 def format_chat_history(history: list[ChatHistorySchema]) -> list:
