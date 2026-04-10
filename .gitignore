@@ -5,3 +5,10 @@ __pycache__/
 # macOS metadata
 .DS_Store
 ._*
+
+# local rebuild config
+scripts/rebuild_vectors.config
+
+# local ops folders
+server/
+scripts/

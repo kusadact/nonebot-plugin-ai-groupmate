@@ -3,28 +3,24 @@ import asyncio
 import datetime
 import traceback
 import json
-import base64
-import shutil
-import hashlib
-import hmac
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
-import threading
+import base64
+import mimetypes
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import jieba
-from PIL import Image as PILImage
 from nonebot import logger, require, on_command, on_message, get_plugin_config, get_driver
 from nonebot.permission import SUPERUSER
+from pydantic import SecretStr
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
 from nonebot.adapters import Bot, Event, Message
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage as LCHumanMessage, SystemMessage as LCSystemMessage
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
@@ -32,7 +28,7 @@ require("nonebot_plugin_uninfo")
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
-from sqlalchemy import Select, desc
+from sqlalchemy import Select, desc, func as sqlfunc
 from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
@@ -40,16 +36,15 @@ from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_i
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
-from .vlm import image_vl
-from .agent import choice_response_strategy
-from .model import ChatHistory, MediaStorage, ChatHistorySchema
+from .agent import check_if_should_reply, choice_response_strategy
+from .model import ChatHistory, MediaStorage, ChatHistorySchema, GroupMemory
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
 from .config import Config
-from .milvus import MilvusOP
+from .memory import DB
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -68,6 +63,205 @@ plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
+_DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def _pick_api_key(*values: str) -> str:
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+_summary_api_key = _pick_api_key(plugin_config.summary_api_key, plugin_config.qwen_token, plugin_config.openai_token)
+summary_model = (
+    ChatOpenAI(
+        model=plugin_config.summary_model,
+        api_key=SecretStr(_summary_api_key),
+        base_url=plugin_config.summary_base_url or _DEFAULT_DASHSCOPE_BASE_URL,
+        temperature=0.3,
+        max_completion_tokens=800,
+    )
+    if plugin_config.summary_model and _summary_api_key
+    else None
+)
+
+_multimodal_api_key = _pick_api_key(plugin_config.multimodal_api_key, plugin_config.qwen_token)
+multimodal_model = (
+    ChatOpenAI(
+        model=plugin_config.multimodal_model,
+        api_key=SecretStr(_multimodal_api_key),
+        base_url=plugin_config.multimodal_base_url or _DEFAULT_DASHSCOPE_BASE_URL,
+        temperature=0.01,
+    )
+    if plugin_config.multimodal_model and _multimodal_api_key
+    else None
+)
+
+
+def _extract_model_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = _strip_code_fence(text)
+    if not cleaned:
+        return None
+
+    try:
+        payload = json.loads(cleaned)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or start >= end:
+        return None
+
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _image_to_data_uri(file_path: Path) -> str:
+    mime_type = mimetypes.guess_type(str(file_path))[0] or "image/png"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+    payload = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{payload}"
+
+
+async def _call_multimodal_model(prompt: str, file_path: Path, timeout_s: float = 90.0) -> str | None:
+    if multimodal_model is None:
+        return None
+
+    try:
+        response = await asyncio.wait_for(
+            multimodal_model.ainvoke(
+                [
+                    LCSystemMessage(content="你是一个图片分析助手，请严格按照要求输出结果。"),
+                    LCHumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": _image_to_data_uri(file_path)}},
+                        ]
+                    ),
+                ]
+            ),
+            timeout=timeout_s,
+        )
+        text = _extract_model_text(response.content)
+        return text or None
+    except asyncio.TimeoutError:
+        logger.warning(f"多模态模型调用超时: {file_path}")
+        return None
+    except Exception as e:
+        logger.error(f"多模态模型调用失败 {file_path}: {e}")
+        return None
+
+
+async def _describe_image_short(file_path: Path) -> str:
+    prompt = (
+        "请用一句中文简短描述这张图片，保留主体和情绪信息，"
+        "不要编造细节，不要超过30个字，只输出描述本身。"
+    )
+    result = await _call_multimodal_model(prompt, file_path, timeout_s=60.0)
+    if not result:
+        return "[图片]"
+    result = _strip_code_fence(result).replace("\n", " ").strip()
+    if not result:
+        return "[图片]"
+    return result[:60]
+
+
+async def _analyze_meme_image(file_path: Path) -> tuple[bool | None, str]:
+    prompt = """
+你是一个专业的表情包分析员。请分析这张图片，并严格输出 JSON。
+
+判断规则：
+1. 如果是带梗、表情、配字吐槽、二创、熊猫头、二次元 reaction image，is_meme=true。
+2. 如果只是普通照片、聊天截图、风景、证件照、商品图、长篇文档截图，is_meme=false。
+3. description 需要概括主体、文字内容和表达情绪，方便后续搜索。
+
+只输出下面格式，不要输出其他内容：
+{
+  "is_meme": true,
+  "description": "熊猫头流泪，配文我太难了，表达委屈和无奈"
+}
+"""
+    result = await _call_multimodal_model(prompt, file_path, timeout_s=90.0)
+    payload = _extract_json_object(result or "")
+    if payload is None:
+        logger.warning(f"多模态模型未返回合法 JSON: {file_path}")
+        return None, ""
+
+    is_meme = payload.get("is_meme")
+    description = str(payload.get("description", "") or "").strip()
+    if not isinstance(is_meme, bool):
+        return None, description
+    return is_meme, description
+
+
+async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
+    if summary_model is None:
+        return None
+
+    system_prompt = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
+档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
+规则：
+1. 只能基于提供的聊天记录总结，不要凭空发明内容
+2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
+3. 如果某个内容长期没有聊天印证，可删除
+4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容"""
+    history_intro = "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
+    user_prompt = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{chat_text}\n\n请输出更新后的档案："
+
+    try:
+        response = await asyncio.wait_for(
+            summary_model.ainvoke(
+                [
+                    LCSystemMessage(content=system_prompt),
+                    LCHumanMessage(content=user_prompt),
+                ]
+            ),
+            timeout=120.0,
+        )
+        text = _extract_model_text(response.content)
+        return text or None
+    except asyncio.TimeoutError:
+        logger.warning("群体认知档案更新超时，跳过本轮")
+        return None
+    except Exception as e:
+        logger.error(f"群体认知档案更新失败: {e}")
+        return None
+
 switch_file = plugin_data_dir / "switch.json"
 _enabled = True
 if switch_file.exists():
@@ -75,16 +269,6 @@ if switch_file.exists():
         _enabled = json.loads(switch_file.read_text(encoding="utf-8")).get("enabled", True)
     except Exception:
         _enabled = True
-
-# Seedance 单并发闸门：账户同一时间仅允许一个生成任务
-_seedance_busy_lock = threading.Lock()
-_seedance_busy = False
-_seedance_busy_request_id = ""
-_seedance_busy_task_id = ""
-_seedance_busy_owner = ""
-_seedance_busy_session = ""
-_seedance_busy_since: datetime.datetime | None = None
-
 
 def _is_enabled() -> bool:
     return _enabled
@@ -94,137 +278,6 @@ def _set_enabled(value: bool) -> None:
     global _enabled
     _enabled = value
     switch_file.write_text(json.dumps({"enabled": value}, ensure_ascii=False), encoding="utf-8")
-
-
-def _get_seedance_whitelist() -> set[str]:
-    return {str(i).strip() for i in plugin_config.seedance_tool_whitelist if str(i).strip()}
-
-
-def _try_acquire_seedance_slot(request_id: str, caller_id: str, session_id: str) -> tuple[bool, str]:
-    global _seedance_busy, _seedance_busy_request_id, _seedance_busy_task_id
-    global _seedance_busy_owner, _seedance_busy_session, _seedance_busy_since
-
-    with _seedance_busy_lock:
-        if _seedance_busy:
-            since = _seedance_busy_since.strftime("%H:%M:%S") if _seedance_busy_since else "unknown"
-            running = _seedance_busy_task_id or _seedance_busy_request_id or "unknown"
-            msg = (
-                "[Seedance] 当前已有任务正在生成中，请等待完成后再试，本次请求无效。\n"
-                f"running_task={running}\n"
-                f"started_at={since}"
-            )
-            return False, msg
-
-        _seedance_busy = True
-        _seedance_busy_request_id = request_id
-        _seedance_busy_task_id = ""
-        _seedance_busy_owner = caller_id
-        _seedance_busy_session = session_id
-        _seedance_busy_since = datetime.datetime.now()
-        return True, ""
-
-
-def _set_seedance_running_task_id(request_id: str, task_id: str) -> None:
-    global _seedance_busy_task_id
-    with _seedance_busy_lock:
-        if _seedance_busy and _seedance_busy_request_id == request_id:
-            _seedance_busy_task_id = task_id
-
-
-def _release_seedance_slot(request_id: str) -> None:
-    global _seedance_busy, _seedance_busy_request_id, _seedance_busy_task_id
-    global _seedance_busy_owner, _seedance_busy_session, _seedance_busy_since
-    with _seedance_busy_lock:
-        if _seedance_busy and _seedance_busy_request_id == request_id:
-            _seedance_busy = False
-            _seedance_busy_request_id = ""
-            _seedance_busy_task_id = ""
-            _seedance_busy_owner = ""
-            _seedance_busy_session = ""
-            _seedance_busy_since = None
-
-
-def _is_seedance_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-
-    # 清理常见前缀，降低“假 at 文本”影响
-    if t.startswith("@"):
-        parts = t.split(maxsplit=1)
-        if len(parts) == 2:
-            t = parts[1].strip()
-
-    # 显式排除陈述/说明/提问句，避免误触发
-    deny_hits = (
-        "可以生成",
-        "能生成",
-        "会生成",
-        "支持生成",
-        "现在可以生成",
-        "用于生成",
-        "是否生成",
-        "怎么生成",
-        "如何生成",
-        "不生成",
-        "不要生成",
-        "别生成",
-    )
-    if any(k in t for k in deny_hits):
-        return False
-
-    media_words = ("图", "图片", "照片", "相片", "图像", "视频", "短片", "海报", "壁纸")
-    action_words = ("生成", "画", "做", "出图", "生图", "文生图", "文生视频", "制作")
-    if not any(m in t for m in media_words):
-        return False
-    if not any(a in t for a in action_words):
-        return False
-
-    # 明确命令短语：优先判定为请求
-    direct_cmd_hits = (
-        "帮我生成",
-        "给我生成",
-        "请生成",
-        "麻烦生成",
-        "帮我画",
-        "给我画",
-        "请画",
-        "画一张",
-        "画个",
-        "来一张",
-        "来张",
-        "做个视频",
-        "生成一张",
-        "生成一个",
-        "生成一段",
-    )
-    if any(k in t for k in direct_cmd_hits):
-        return True
-
-    # 句首就是命令动词，也判定为请求
-    command_starts = (
-        "生成",
-        "画",
-        "做",
-        "出图",
-        "生图",
-        "文生图",
-        "文生视频",
-    )
-    if t.startswith(command_starts):
-        return True
-
-    # 最后兜底：要求同时出现“请求语气 + 动作 + 媒体”
-    request_tones = ("帮我", "给我", "请", "麻烦", "求", "我要", "我想要")
-    return any(r in t for r in request_tones) and any(a in t for a in action_words) and any(m in t for m in media_words)
-
-
-def _is_seedance_video_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    video_words = ("视频", "短片", "动图", "动画", "动起来", "做视频", "文生视频", "视频生成")
-    return any(k in t for k in video_words)
 
 
 def _event_at_bot(event: Event, bot: Bot) -> bool:
@@ -296,14 +349,6 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
     return None
 
 
-def _extract_seedance_prompt(text: str) -> str:
-    prompt = (text or "").strip()
-    bot_name = (plugin_config.bot_name or "").strip()
-    if bot_name and prompt.lower().startswith(bot_name.lower()):
-        prompt = prompt[len(bot_name) :].lstrip(" :：，,")
-    return prompt.strip()
-
-
 async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
     text = (plain_text or "").strip()
     if not text:
@@ -339,10 +384,6 @@ async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, i
         if low_text.startswith(f"@{n}") or low_text.startswith(f"＠{n}"):
             return True
     return False
-
-
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 _MEME_BLOCK_FEEDBACK_KEYWORDS = (
@@ -505,6 +546,11 @@ async def _try_auto_block_replied_meme(
                 f"err={type(e).__name__}: {e}"
             )
             return False
+        if DB.enabled:
+            try:
+                await DB.delete_media(media_id_int)
+            except Exception as e:
+                logger.warning(f"[MemeBlock] 从 Qdrant 删除拉黑表情包失败 media_id={media_id_int}: {e}")
     logger.info(
         f"[MemeBlock] superuser={sender_user_id} session_id={session_id} "
         f"reply_to={reply_message_id} media_id={media_id_int} changed={changed}"
@@ -518,795 +564,6 @@ async def _try_auto_block_replied_meme(
         await UniMessage.text(tip).send(reply_to=True)
     except Exception as e:
         logger.warning(f"[MemeBlock] 发送拉黑提示失败: {type(e).__name__}: {e}")
-    return True
-
-
-def _hmac_sha256(key: bytes, text: str) -> bytes:
-    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).digest()
-
-
-def _find_first_str(data: Any, keys: set[str]) -> str | None:
-    lower_keys = {k.lower() for k in keys}
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if str(k).lower() in lower_keys and isinstance(v, (str, int, float)):
-                return str(v)
-            nested = _find_first_str(v, keys)
-            if nested:
-                return nested
-    elif isinstance(data, list):
-        for item in data:
-            nested = _find_first_str(item, keys)
-            if nested:
-                return nested
-    return None
-
-
-def _collect_media_urls(data: Any) -> list[str]:
-    urls: list[str] = []
-
-    def walk(obj: Any) -> None:
-        if isinstance(obj, str):
-            if obj.startswith(("http://", "https://")):
-                urls.append(obj)
-            return
-        if isinstance(obj, list):
-            for item in obj:
-                walk(item)
-            return
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                lk = str(k).lower()
-                if lk in {"image_url", "video_url", "url"}:
-                    walk(v)
-                elif lk in {"image_urls", "video_urls", "urls"}:
-                    walk(v)
-                elif isinstance(v, (dict, list)):
-                    walk(v)
-
-    walk(data)
-    dedup: list[str] = []
-    seen: set[str] = set()
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            dedup.append(u)
-    return dedup
-
-
-def _collect_base64_payloads(data: Any) -> list[str]:
-    keys = {"binary_data_base64", "image_base64", "images_base64", "video_base64", "base64", "b64"}
-    payloads: list[str] = []
-
-    def add_payload(s: str) -> None:
-        text = (s or "").strip()
-        if not text:
-            return
-        if text.startswith("data:") and "," in text:
-            text = text.split(",", 1)[1].strip()
-        text = text.replace("\n", "").replace("\r", "")
-        if len(text) < 64:
-            return
-        payloads.append(text)
-
-    def walk(obj: Any) -> None:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                lk = str(k).lower()
-                if lk in keys:
-                    if isinstance(v, str):
-                        add_payload(v)
-                    elif isinstance(v, list):
-                        for item in v:
-                            if isinstance(item, str):
-                                add_payload(item)
-                    continue
-                if isinstance(v, (dict, list)):
-                    walk(v)
-            return
-        if isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    walk(item)
-
-    walk(data)
-    dedup: list[str] = []
-    seen: set[str] = set()
-    for p in payloads:
-        if p not in seen:
-            seen.add(p)
-            dedup.append(p)
-    return dedup
-
-
-def _guess_generated_file_ext(raw: bytes, is_video: bool) -> str:
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "jpg"
-    if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
-        return "gif"
-    if raw.startswith(b"RIFF") and len(raw) > 12 and raw[8:12] == b"WEBP":
-        return "webp"
-    if len(raw) > 12 and raw[4:8] == b"ftyp":
-        return "mp4"
-    return "mp4" if is_video else "png"
-
-
-async def _save_seedance_base64_outputs(base64_payloads: list[str], request_id: str, is_video: bool) -> list[str]:
-    static_dir = (plugin_config.seedance_static_dir or "").strip()
-    static_base_url = (plugin_config.seedance_static_base_url or "").strip().rstrip("/")
-    if not static_dir:
-        raise RuntimeError("未配置 ai_groupmate__seedance_static_dir")
-    if not static_base_url:
-        raise RuntimeError("未配置 ai_groupmate__seedance_static_base_url")
-
-    request_temp_dir = Path(static_dir) / "temp" / request_id
-    request_temp_dir.mkdir(parents=True, exist_ok=True)
-
-    urls: list[str] = []
-    try:
-        max_items = min(len(base64_payloads), 8)
-        for idx, payload in enumerate(base64_payloads[:max_items], start=1):
-            raw = base64.b64decode(payload)
-            ext = _guess_generated_file_ext(raw, is_video=is_video)
-            filename = f"result_{idx:02d}.{ext}"
-            file_path = request_temp_dir / filename
-            await asyncio.to_thread(file_path.write_bytes, raw)
-            urls.append(f"{static_base_url}/temp/{request_id}/{filename}")
-    finally:
-        _schedule_seedance_temp_cleanup(request_temp_dir, request_id)
-
-    logger.info(
-        f"[SeedanceTemp] saved generated outputs request_id={request_id} "
-        f"count={len(urls)} dir={request_temp_dir}"
-    )
-    return urls
-
-
-def _volc_openapi_post(action: str, body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
-    access_key_id = (plugin_config.seedance_access_key_id or "").strip()
-    secret_access_key = (plugin_config.seedance_secret_access_key or "").strip()
-    if not access_key_id or not secret_access_key:
-        raise RuntimeError("未配置 ai_groupmate__seedance_access_key_id 或 ai_groupmate__seedance_secret_access_key")
-
-    endpoint = (plugin_config.seedance_endpoint or "").strip() or "https://visual.volcengineapi.com"
-    if "://" not in endpoint:
-        endpoint = f"https://{endpoint}"
-
-    parsed = urllib.parse.urlparse(endpoint)
-    if not parsed.scheme or not parsed.netloc:
-        raise RuntimeError(f"seedance_endpoint 非法: {endpoint}")
-
-    host = parsed.netloc
-    path = parsed.path or "/"
-    if not path.startswith("/"):
-        path = f"/{path}"
-
-    query_pairs = [
-        ("Action", action),
-        ("Version", (plugin_config.seedance_api_version or "").strip() or "2022-08-31"),
-    ]
-    encoded_pairs = [
-        (urllib.parse.quote(str(k), safe="-_.~"), urllib.parse.quote(str(v), safe="-_.~"))
-        for k, v in query_pairs
-    ]
-    encoded_pairs.sort()
-    canonical_query = "&".join([f"{k}={v}" for k, v in encoded_pairs])
-    request_url = f"{parsed.scheme}://{host}{path}?{canonical_query}"
-
-    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    payload_hash = _sha256_hex(payload)
-    x_date = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    short_date = x_date[:8]
-    region = (plugin_config.seedance_region or "").strip() or "cn-north-1"
-    service = (plugin_config.seedance_service or "").strip() or "cv"
-
-    canonical_headers = (
-        "content-type:application/json\n"
-        f"host:{host}\n"
-        f"x-content-sha256:{payload_hash}\n"
-        f"x-date:{x_date}\n"
-    )
-    signed_headers = "content-type;host;x-content-sha256;x-date"
-    canonical_request = "\n".join(
-        [
-            "POST",
-            path,
-            canonical_query,
-            canonical_headers,
-            signed_headers,
-            payload_hash,
-        ]
-    )
-
-    credential_scope = f"{short_date}/{region}/{service}/request"
-    string_to_sign = "\n".join(
-        [
-            "HMAC-SHA256",
-            x_date,
-            credential_scope,
-            _sha256_hex(canonical_request),
-        ]
-    )
-
-    k_date = _hmac_sha256(secret_access_key.encode("utf-8"), short_date)
-    k_region = _hmac_sha256(k_date, region)
-    k_service = _hmac_sha256(k_region, service)
-    k_signing = _hmac_sha256(k_service, "request")
-    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    authorization = (
-        "HMAC-SHA256 "
-        f"Credential={access_key_id}/{credential_scope}, "
-        f"SignedHeaders={signed_headers}, "
-        f"Signature={signature}"
-    )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Host": host,
-        "X-Date": x_date,
-        "X-Content-Sha256": payload_hash,
-        "Authorization": authorization,
-    }
-    req = urllib.request.Request(
-        url=request_url,
-        data=payload.encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        err_raw = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {err_raw}") from e
-    except Exception as e:
-        raise RuntimeError(f"请求火山接口失败: {e}") from e
-
-    try:
-        data = json.loads(raw) if raw else {}
-    except Exception as e:
-        raise RuntimeError(f"响应 JSON 解析失败: {e}; raw={raw[:300]}") from e
-
-    if not isinstance(data, dict):
-        raise RuntimeError(f"响应格式异常: {type(data).__name__}")
-
-    # OpenAPI 典型错误结构
-    response_meta = data.get("ResponseMetadata")
-    if isinstance(response_meta, dict):
-        err = response_meta.get("Error")
-        if isinstance(err, dict):
-            code = err.get("Code") or err.get("CodeN") or "UnknownError"
-            msg = err.get("Message") or err.get("MessageCN") or str(err)
-            req_id = response_meta.get("RequestId") or ""
-            raise RuntimeError(f"{code}: {msg} request_id={req_id}".strip())
-
-    # 兼容部分网关返回结构
-    code = data.get("code")
-    if isinstance(code, int) and code not in (0, 10000):
-        message = data.get("message") or data.get("msg") or "unknown error"
-        raise RuntimeError(f"code={code}, message={message}")
-
-    return data
-
-
-def _build_seedance_submit_payload(prompt: str, ref_urls: list[str], is_video: bool) -> tuple[str, dict[str, Any]]:
-    if is_video:
-        req_key = plugin_config.seedance_video_i2v_req_key if ref_urls else plugin_config.seedance_video_t2v_req_key
-        model = (plugin_config.seedance_video_model or "").strip()
-    else:
-        req_key = plugin_config.seedance_image_i2i_req_key if ref_urls else plugin_config.seedance_image_t2i_req_key
-        model = (plugin_config.seedance_image_model or "").strip()
-
-    req_key = (req_key or "").strip()
-    if not req_key:
-        raise RuntimeError("缺少 req_key 配置，请检查 seedance_image_* 或 seedance_video_* 配置")
-
-    payload: dict[str, Any] = {
-        "req_key": req_key,
-        "prompt": prompt,
-    }
-    if model:
-        payload["model"] = model
-    if ref_urls:
-        payload["image_urls"] = ref_urls
-    return req_key, payload
-
-
-async def _seedance_submit_task(req_key: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    action = (plugin_config.seedance_action_submit or "").strip() or "CVSync2AsyncSubmitTask"
-    submit_resp = await asyncio.to_thread(_volc_openapi_post, action, payload)
-    task_id = _find_first_str(submit_resp, {"task_id", "taskid", "TaskId"})
-    if not task_id:
-        raise RuntimeError(f"提交任务成功但未返回 task_id: {json.dumps(submit_resp, ensure_ascii=False)[:600]}")
-
-    logger.info(
-        f"[SeedanceAPI] submit ok req_key={req_key} task_id={task_id} "
-        f"request_id={_find_first_str(submit_resp, {'request_id', 'RequestId'})}"
-    )
-    return task_id, submit_resp
-
-
-async def _seedance_get_result_once(req_key: str, task_id: str) -> dict[str, Any]:
-    action = (plugin_config.seedance_action_result or "").strip() or "CVSync2AsyncGetResult"
-    payload = {"req_key": req_key, "task_id": task_id}
-    return await asyncio.to_thread(_volc_openapi_post, action, payload)
-
-
-async def _seedance_poll_result(req_key: str, task_id: str) -> dict[str, Any]:
-    timeout = max(10, int(plugin_config.seedance_poll_timeout_seconds))
-    interval = max(1, int(plugin_config.seedance_poll_interval_seconds))
-    start = asyncio.get_running_loop().time()
-    last_resp: dict[str, Any] = {}
-    last_status = "unknown"
-    success_status = {"done", "success", "succeeded", "finished", "complete", "completed"}
-    failed_status = {"fail", "failed", "error", "cancel", "canceled", "cancelled"}
-
-    while True:
-        if asyncio.get_running_loop().time() - start > timeout:
-            raise TimeoutError(
-                f"任务轮询超时 {timeout}s, task_id={task_id}, last_status={last_status}, "
-                f"last_resp={json.dumps(last_resp, ensure_ascii=False)[:400]}"
-            )
-
-        resp = await _seedance_get_result_once(req_key, task_id)
-        last_resp = resp
-        status_raw = _find_first_str(resp, {"status", "task_status", "state"}) or "unknown"
-        last_status = status_raw
-        status = status_raw.lower().strip()
-        urls = _collect_media_urls(resp)
-
-        if status in success_status:
-            return resp
-        if status in failed_status:
-            raise RuntimeError(f"任务失败 status={status_raw}, resp={json.dumps(resp, ensure_ascii=False)[:500]}")
-        if urls and status == "unknown":
-            # 兼容极少数返回不带状态但已携带结果 URL 的场景
-            return resp
-
-        await asyncio.sleep(interval)
-
-
-def _cleanup_seedance_temp_dir(temp_dir: str, request_id: str) -> None:
-    target = Path(temp_dir)
-    try:
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-            logger.info(f"[SeedanceTemp] cleaned request_id={request_id} dir={target}")
-    except Exception as e:
-        logger.error(f"[SeedanceTemp] cleanup failed request_id={request_id}: {e}")
-
-
-def _cleanup_seedance_temp_expired_once() -> None:
-    static_dir = (plugin_config.seedance_static_dir or "").strip()
-    if not static_dir:
-        return
-
-    ttl_seconds = max(1, int(plugin_config.seedance_temp_ttl_minutes)) * 60
-    base = Path(static_dir) / "temp"
-    if not base.exists():
-        return
-
-    now_ts = datetime.datetime.now().timestamp()
-    for child in base.iterdir():
-        if not child.is_dir():
-            continue
-        try:
-            age = now_ts - child.stat().st_mtime
-            if age >= ttl_seconds:
-                shutil.rmtree(child, ignore_errors=True)
-                logger.info(f"[SeedanceTemp] gc removed expired dir={child} age_seconds={int(age)}")
-        except Exception as e:
-            logger.error(f"[SeedanceTemp] gc failed dir={child}: {e}")
-
-
-def _schedule_seedance_temp_cleanup(temp_dir: Path, request_id: str) -> None:
-    ttl = max(1, int(plugin_config.seedance_temp_ttl_minutes))
-    run_date = datetime.datetime.now() + datetime.timedelta(minutes=ttl)
-    job_id = f"seedance_cleanup_{request_id}"
-    scheduler.add_job(
-        _cleanup_seedance_temp_dir,
-        trigger="date",
-        run_date=run_date,
-        id=job_id,
-        replace_existing=True,
-        kwargs={
-            "temp_dir": str(temp_dir),
-            "request_id": request_id,
-        },
-    )
-    logger.info(f"[SeedanceTemp] scheduled cleanup request_id={request_id} ttl_minutes={ttl} dir={temp_dir}")
-
-
-def _guess_image_ext(img: Image) -> str:
-    value = str(getattr(img, "id", "") or "")
-    value = value.split("?", 1)[0]
-    if "." in value:
-        ext = value.rsplit(".", 1)[-1].strip().lower()
-        if ext.isalnum() and 1 <= len(ext) <= 6:
-            return ext
-    return "png"
-
-
-async def _save_seedance_reference_images(
-    imgs: list[Image],
-    event: Event,
-    bot: Bot,
-    state: T_State,
-    request_id: str,
-) -> list[dict[str, str]]:
-    max_refs = max(0, int(plugin_config.seedance_max_reference_images))
-    if max_refs == 0:
-        return []
-
-    selected = list(imgs)[:max_refs]
-    if not selected:
-        return []
-
-    static_dir = (plugin_config.seedance_static_dir or "").strip()
-    static_base_url = (plugin_config.seedance_static_base_url or "").strip().rstrip("/")
-    if not static_dir:
-        raise RuntimeError("未配置 ai_groupmate__seedance_static_dir")
-    if not static_base_url:
-        raise RuntimeError("未配置 ai_groupmate__seedance_static_base_url")
-
-    request_temp_dir = Path(static_dir) / "temp" / request_id
-    request_temp_dir.mkdir(parents=True, exist_ok=True)
-
-    refs: list[dict[str, str]] = []
-    try:
-        for idx, img in enumerate(selected, start=1):
-            ext = _guess_image_ext(img)
-            filename = f"{idx:02d}.{ext}"
-            file_path = request_temp_dir / filename
-
-            image_bytes = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=20.0)
-            await asyncio.to_thread(file_path.write_bytes, image_bytes)
-
-            public_url = f"{static_base_url}/temp/{request_id}/{filename}"
-            refs.append(
-                {
-                    "index": str(idx),
-                    "filename": filename,
-                    "url": public_url,
-                }
-            )
-
-        logger.info(
-            f"[SeedanceTemp] saved request_id={request_id} count={len(refs)} "
-            f"dir={request_temp_dir} order={[r['filename'] for r in refs]}"
-        )
-        return refs
-    finally:
-        _schedule_seedance_temp_cleanup(request_temp_dir, request_id)
-
-
-async def _send_bot_reply_and_record(db_session: async_scoped_session, session_id: str, content: str) -> None:
-    res = await UniMessage.text(content).send()
-    msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
-    chat_history = ChatHistory(
-        session_id=session_id,
-        user_id=plugin_config.bot_name,
-        content_type="bot",
-        content=f"id:{msg_id}\n" + content,
-        user_name=plugin_config.bot_name,
-    )
-    db_session.add(chat_history)
-    await db_session.commit()
-    logger.info(f"Bot已回复: {content}")
-
-
-def _map_static_url_to_local_path(url: str) -> Path | None:
-    static_base_url = (plugin_config.seedance_static_base_url or "").strip().rstrip("/")
-    static_dir = (plugin_config.seedance_static_dir or "").strip()
-    if not static_base_url or not static_dir:
-        return None
-
-    try:
-        base = urllib.parse.urlparse(static_base_url)
-        target = urllib.parse.urlparse(url)
-    except Exception:
-        return None
-
-    if not target.scheme or not target.netloc:
-        return None
-    if (target.scheme, target.netloc) != (base.scheme, base.netloc):
-        return None
-
-    base_path = base.path.rstrip("/")
-    target_path = target.path
-    if base_path and not target_path.startswith(base_path + "/"):
-        return None
-
-    rel = target_path[len(base_path) :].lstrip("/") if base_path else target_path.lstrip("/")
-    if not rel:
-        return None
-    return Path(static_dir).joinpath(*rel.split("/"))
-
-
-def _download_url_bytes(url: str, timeout: int = 20) -> bytes:
-    req = urllib.request.Request(url=url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
-
-
-async def _send_seedance_images_and_record(db_session: async_scoped_session, session_id: str, image_urls: list[str]) -> tuple[int, int]:
-    success = 0
-    failed = 0
-    for idx, url in enumerate(image_urls, start=1):
-        try:
-            sent_res = None
-            local_path = _map_static_url_to_local_path(url)
-            if local_path and local_path.exists():
-                image_bytes = await asyncio.to_thread(local_path.read_bytes)
-                sent_res = await UniMessage.image(raw=image_bytes).send()
-            else:
-                try:
-                    sent_res = await UniMessage.image(url=url).send()
-                except Exception:
-                    image_bytes = await asyncio.to_thread(_download_url_bytes, url, 20)
-                    sent_res = await UniMessage.image(raw=image_bytes).send()
-
-            msg_id = sent_res.msg_ids[-1]["message_id"] if sent_res and sent_res.msg_ids else "unknown"
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=plugin_config.bot_name,
-                content_type="bot",
-                content=f"id:{msg_id}\n[Seedance] 发送生成图片 第{idx}张",
-                user_name=plugin_config.bot_name,
-            )
-            db_session.add(chat_history)
-            await db_session.commit()
-            success += 1
-        except Exception as e:
-            failed += 1
-            await db_session.rollback()
-            logger.error(f"[Seedance] 发送生成图片失败 idx={idx} url={url}: {type(e).__name__}: {e}")
-    return success, failed
-
-
-async def _send_seedance_videos_and_record(db_session: async_scoped_session, session_id: str, video_urls: list[str]) -> tuple[int, int]:
-    success = 0
-    failed = 0
-    for idx, url in enumerate(video_urls, start=1):
-        try:
-            sent_res = None
-            local_path = _map_static_url_to_local_path(url)
-            if local_path and local_path.exists():
-                video_bytes = await asyncio.to_thread(local_path.read_bytes)
-                if hasattr(UniMessage, "video"):
-                    sent_res = await UniMessage.video(raw=video_bytes).send()
-                else:
-                    raise RuntimeError("当前 UniMessage 不支持 video 发送")
-            else:
-                if hasattr(UniMessage, "video"):
-                    try:
-                        sent_res = await UniMessage.video(url=url).send()
-                    except Exception:
-                        video_bytes = await asyncio.to_thread(_download_url_bytes, url, 30)
-                        sent_res = await UniMessage.video(raw=video_bytes).send()
-                else:
-                    raise RuntimeError("当前 UniMessage 不支持 video 发送")
-
-            msg_id = sent_res.msg_ids[-1]["message_id"] if sent_res and sent_res.msg_ids else "unknown"
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=plugin_config.bot_name,
-                content_type="bot",
-                content=f"id:{msg_id}\n[Seedance] 发送生成视频 第{idx}条",
-                user_name=plugin_config.bot_name,
-            )
-            db_session.add(chat_history)
-            await db_session.commit()
-            success += 1
-        except Exception as e:
-            failed += 1
-            await db_session.rollback()
-            logger.error(f"[Seedance] 发送生成视频失败 idx={idx} url={url}: {type(e).__name__}: {e}")
-    return success, failed
-
-
-async def _handle_seedance_request_direct(
-    db_session: async_scoped_session,
-    session: Uninfo,
-    plain_text: str,
-    to_me: bool,
-    imgs: list[Image],
-    event: Event,
-    bot: Bot,
-    state: T_State,
-) -> bool:
-    # 返回 True 表示该消息已被 Seedance 分支处理（含静默忽略）
-    logger.debug(
-        f"[SeedanceGate] probe caller={session.user.id} session_id={session.scene.id} "
-        f"to_me={to_me} text={plain_text[:120]!r}"
-    )
-    if not _is_seedance_request(plain_text):
-        return False
-
-    caller_id = str(session.user.id)
-    whitelist = _get_seedance_whitelist()
-    request_id = f"seedance_gate_{int(datetime.datetime.now().timestamp())}_{random.randint(1000, 9999)}"
-
-    # 白名单为空时默认所有人可用；白名单有值时才做拦截
-    if whitelist and caller_id not in whitelist:
-        logger.warning(
-            f"[SeedanceGate] request_id={request_id} auth_passed=false "
-            f"caller={caller_id} session_id={session.scene.id} action=ignore"
-        )
-        return True
-
-    # 白名单但未明确对 bot 发起请求：也忽略，避免误触发
-    if not to_me:
-        logger.info(
-            f"[SeedanceGate] request_id={request_id} auth_passed=true "
-            f"caller={caller_id} session_id={session.scene.id} action=ignore_not_to_me"
-        )
-        return True
-
-    acquired, busy_msg = _try_acquire_seedance_slot(request_id, caller_id, session.scene.id)
-    if not acquired:
-        logger.warning(
-            f"[SeedanceGate] request_id={request_id} auth_passed=true "
-            f"caller={caller_id} session_id={session.scene.id} action=busy_reject"
-        )
-        try:
-            await _send_bot_reply_and_record(db_session, session.scene.id, busy_msg)
-        except Exception:
-            logger.exception(f"[SeedanceGate] request_id={request_id} busy_reply_failed")
-        return True
-
-    # 白名单 + 明确请求：固定路径处理，避免 agent 幻觉
-    logger.success(
-        f"[SeedanceGate] request_id={request_id} auth_passed=true "
-        f"caller={caller_id} session_id={session.scene.id} action=process"
-    )
-    try:
-        ref_images = await _save_seedance_reference_images(imgs, event, bot, state, request_id)
-        ref_urls = [r["url"] for r in ref_images]
-        is_video = _is_seedance_video_request(plain_text)
-        prompt = _extract_seedance_prompt(plain_text)
-        if not prompt:
-            prompt = "请生成一段短视频" if is_video else "请生成一张图片"
-
-        req_key, submit_payload = _build_seedance_submit_payload(prompt, ref_urls, is_video)
-        task_id, _ = await _seedance_submit_task(req_key, submit_payload)
-        _set_seedance_running_task_id(request_id, task_id)
-        await _send_bot_reply_and_record(
-            db_session,
-            session.scene.id,
-            (
-                f"[Seedance] request_id={request_id} 任务已提交。\n"
-                f"task_id={task_id}\n"
-                f"类型={'视频' if is_video else '图片'} req_key={req_key}\n"
-                f"状态=排队/生成中，请稍候..."
-            ),
-        )
-        result_resp = await _seedance_poll_result(req_key, task_id)
-        result_urls = _collect_media_urls(result_resp)
-        if ref_urls:
-            ref_set = set(ref_urls)
-            result_urls = [u for u in result_urls if u not in ref_set]
-        base64_hint = ""
-        if not result_urls:
-            base64_payloads = _collect_base64_payloads(result_resp)
-            if base64_payloads:
-                try:
-                    result_urls = await _save_seedance_base64_outputs(base64_payloads, request_id, is_video)
-                except Exception as e:
-                    base64_hint = (
-                        f"\n检测到 {len(base64_payloads)} 个base64结果，"
-                        f"但落盘失败: {type(e).__name__}: {e}"
-                    )
-        media_name = "视频" if is_video else "图片"
-        max_output_images = max(1, int(getattr(plugin_config, "seedance_max_output_images", 1)))
-        if not is_video and result_urls:
-            if len(result_urls) > max_output_images:
-                logger.info(
-                    f"[SeedanceGate] request_id={request_id} clip image outputs "
-                    f"{len(result_urls)} -> {max_output_images}"
-                )
-            result_urls = result_urls[:max_output_images]
-
-        if ref_images:
-            ref_desc = f"参考图数量={len(ref_images)}（顺序按用户发送）\n"
-        else:
-            ref_desc = "未检测到参考图（本次仅文本提示词）\n"
-
-        if result_urls:
-            result_lines = "\n".join([f"{idx}. {u}" for idx, u in enumerate(result_urls, start=1)])
-            if not is_video:
-                reply_text = (
-                    f"[Seedance] request_id={request_id} 任务成功。\n"
-                    f"task_id={task_id}\n"
-                    f"类型={media_name} req_key={req_key}\n"
-                    f"{ref_desc}"
-                    f"{media_name}结果URL：\n{result_lines}\n"
-                    f"已生成 {len(result_urls)} 张图片，正在发送。\n"
-                    f"临时文件将在 {max(1, int(plugin_config.seedance_temp_ttl_minutes))} 分钟后自动清理。"
-                )
-                await _send_bot_reply_and_record(
-                    db_session,
-                    session.scene.id,
-                    reply_text,
-                )
-                sent_cnt, fail_cnt = await _send_seedance_images_and_record(db_session, session.scene.id, result_urls)
-                if fail_cnt > 0:
-                    await _send_bot_reply_and_record(
-                        db_session,
-                        session.scene.id,
-                        f"[Seedance] 图片发送完成：成功 {sent_cnt}/{len(result_urls)}，失败 {fail_cnt}。",
-                    )
-                return True
-
-            reply_text = (
-                f"[Seedance] request_id={request_id} 任务成功。\n"
-                f"task_id={task_id}\n"
-                f"类型={media_name} req_key={req_key}\n"
-                f"{ref_desc}"
-                f"{media_name}结果URL：\n{result_lines}\n"
-                f"已生成 {len(result_urls)} 条视频，正在发送。\n"
-                f"临时文件将在 {max(1, int(plugin_config.seedance_temp_ttl_minutes))} 分钟后自动清理。"
-            )
-            await _send_bot_reply_and_record(
-                db_session,
-                session.scene.id,
-                reply_text,
-            )
-            sent_cnt, fail_cnt = await _send_seedance_videos_and_record(db_session, session.scene.id, result_urls)
-            if fail_cnt > 0:
-                await _send_bot_reply_and_record(
-                    db_session,
-                    session.scene.id,
-                    f"[Seedance] 视频发送完成：成功 {sent_cnt}/{len(result_urls)}，失败 {fail_cnt}。",
-                )
-            return True
-        else:
-            status = _find_first_str(result_resp, {"status", "task_status", "state"}) or "unknown"
-            reply_text = (
-                f"[Seedance] request_id={request_id} 任务完成但未解析到{media_name}URL。\n"
-                f"task_id={task_id} req_key={req_key} status={status}\n"
-                f"{ref_desc}"
-                f"原始返回片段：{json.dumps(result_resp, ensure_ascii=False)[:500]}"
-                f"{base64_hint}"
-            )
-
-        await _send_bot_reply_and_record(
-            db_session,
-            session.scene.id,
-            reply_text,
-        )
-    except Exception as e:
-        err_msg = f"{type(e).__name__}: {e}"
-        if "HTTP 401" in str(e) and "Access Denied" in str(e):
-            if ref_urls and not is_video:
-                err_text = (
-                    f"[Seedance] request_id={request_id} 调用失败：图生图权限被拒绝（401 Access Denied）。\n"
-                    f"当前使用 req_key={req_key}。\n"
-                    f"请检查 ai_groupmate__seedance_image_i2i_req_key 是否为你账号已开通的图生图模型，"
-                    f"或在火山控制台开通对应能力。"
-                )
-            elif ref_urls and is_video:
-                err_text = (
-                    f"[Seedance] request_id={request_id} 调用失败：图生视频权限被拒绝（401 Access Denied）。\n"
-                    f"当前使用 req_key={req_key}。\n"
-                    f"请检查 ai_groupmate__seedance_video_i2v_req_key 是否为你账号已开通的模型。"
-                )
-            else:
-                err_text = (
-                    f"[Seedance] request_id={request_id} 调用失败：接口鉴权被拒绝（401 Access Denied）。\n"
-                    f"请检查 AK/SK、Region、Service 与账号权限是否匹配。"
-                )
-        else:
-            err_text = f"[Seedance] request_id={request_id} 调用失败: {err_msg}"
-        logger.exception(err_text)
-        try:
-            await _send_bot_reply_and_record(db_session, session.scene.id, err_text)
-        except Exception:
-            logger.exception(f"[SeedanceGate] request_id={request_id} error_reply_failed")
-    finally:
-        _release_seedance_slot(request_id)
     return True
 
 
@@ -1325,67 +582,13 @@ async def _(arg: Message = CommandArg()):
         await ai.finish("ai disabled")
     elif sub in {"status", "state", "s", "", "状态"}:
         status = "on" if _is_enabled() else "off"
-        milvus_uri = (plugin_config.milvus_uri or "").strip()
-        milvus_line = "n/a"
+        if not DB.enabled:
+            qdrant_line = "disabled"
+        else:
+            ok, detail = await DB.healthcheck()
+            qdrant_line = detail if ok else f"down ({detail})"
 
-        if milvus_uri:
-            is_remote = ("://" in milvus_uri) or (milvus_uri.count(":") == 1 and milvus_uri.rsplit(":", 1)[1].isdigit())
-            if not is_remote:
-                # Milvus Lite / local file path
-                p = Path(milvus_uri)
-                milvus_line = "ok" if p.exists() else "down (local)"
-            else:
-                # TCP probe first: distinguish "tunnel down" vs "Milvus down" behind the tunnel.
-                host = None
-                port = None
-                try:
-                    if "://" in milvus_uri:
-                        from urllib.parse import urlparse
-
-                        u = urlparse(milvus_uri)
-                        host = u.hostname
-                        port = u.port or 19530
-                    else:
-                        host, port_s = milvus_uri.rsplit(":", 1)
-                        port = int(port_s)
-                except Exception:
-                    host = None
-                    port = None
-
-                tunnel_ok: bool | None = None
-                tunnel_err = ""
-                if host and port:
-                    try:
-                        r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=0.8)
-                        w.close()
-                        try:
-                            await w.wait_closed()
-                        except Exception:
-                            pass
-                        tunnel_ok = True
-                    except asyncio.TimeoutError:
-                        tunnel_ok = False
-                        tunnel_err = "timeout"
-                    except Exception as e:
-                        tunnel_ok = False
-                        tunnel_err = type(e).__name__
-
-                if tunnel_ok is False:
-                    milvus_line = f"down (tunnel:{tunnel_err})" if tunnel_err else "down (tunnel)"
-                else:
-                    try:
-                        client = MilvusOP._get_async_client()
-                        try:
-                            await asyncio.wait_for(client.list_collections(), timeout=2.0)
-                        except AttributeError:
-                            await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-                        milvus_line = "ok"
-                    except asyncio.TimeoutError:
-                        milvus_line = "down (milvus:timeout)"
-                    except Exception as e:
-                        milvus_line = f"down (milvus:{type(e).__name__})"
-
-        await ai.finish(f"ai status: {status}\nmilvus: {milvus_line}")
+        await ai.finish(f"ai status: {status}\nqdrant: {qdrant_line}")
     else:
         await ai.finish("Usage: /ai on|off|status")
 
@@ -1512,10 +715,6 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         f"at_targets={at_targets} bot_name={plugin_config.bot_name!r} to_me={to_me}"
     )
 
-    # Seedance 请求走固定分支：非白名单静默忽略，白名单失败直出报错，不交给 agent 幻觉发挥
-    if await _handle_seedance_request_direct(db_session, session, plain_text, to_me, imgs, event, bot, state):
-        return
-
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
     if not plain_event_text and not imgs:
         should_reply = False
@@ -1530,7 +729,14 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         user_id = ""
         user_name = ""
     if should_reply:
-        await handle_reply_logic(db_session, session, user_id, user_name)
+        await handle_reply_logic(
+            db_session,
+            session,
+            plugin_config.bot_name,
+            user_id,
+            user_name,
+            to_me,
+        )
 
     await db_session.commit()
 
@@ -1549,73 +755,71 @@ async def process_image_message(
     content_type = "image"
     if not img.id:
         return
-    image_format = img.id.split(".")[-1]
 
-    # 获取和压缩图片
-    pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
-    pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
-    file_hash = generate_file_hash(pic)
-    file_path = pic_dir / f"{file_hash}.{image_format}"
+    image_format = img.id.split(".")[-1] if "." in img.id else "jpg"
+    if not image_format:
+        image_format = "jpg"
 
-    # 保存文件
-    if not file_path.exists():
-        file_path.write_bytes(pic)
     try:
-        # 查询或创建媒体记录
-        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
+        pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.warning("下载图片超时，跳过")
+        return
 
-        if existing_media:
-            # 已存在，直接使用描述
-            image_description = existing_media.description
-            existing_media.references += 1
-            db_session.add(existing_media)
+    try:
+        pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
+        file_hash = generate_file_hash(pic)
+        file_name = f"{file_hash}.{image_format}"
+        file_path = pic_dir / file_name
+
+        if not file_path.exists():
+            file_path.write_bytes(pic)
+
+        stmt = Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
+        media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+        if media_obj:
+            media_obj.references += 1
+            db_session.add(media_obj)
         else:
-            # 新图片，调用VLM获取描述
-            image_description = await image_vl(file_path)
+            try:
+                async with db_session.begin_nested():
+                    media_obj = MediaStorage(
+                        file_hash=file_hash,
+                        file_path=file_name,
+                        references=1,
+                        description="[图片]",
+                    )
+                    db_session.add(media_obj)
+                    await db_session.flush()
+            except IntegrityError:
+                media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+                if media_obj is None:
+                    raise
+                media_obj.references += 1
+                db_session.add(media_obj)
 
-            if image_description:
-                media_storage = MediaStorage(
-                    file_hash=file_hash,
-                    file_path=f"{file_hash}.{image_format}",
-                    references=1,
-                    description=image_description,
-                )
-                db_session.add(media_storage)
-                await db_session.flush()  # 确保获取media_id
-                existing_media = media_storage
+        await db_session.flush()
+
+        image_description = "[图片]"
+        if media_obj:
+            cached_description = (media_obj.description or "").strip()
+            if cached_description and cached_description != "[图片]":
+                image_description = cached_description
             else:
-                file_path.unlink()
+                image_description = await _describe_image_short(file_path)
+                media_obj.description = image_description
+                db_session.add(media_obj)
 
-        # 添加聊天历史记录
-        if existing_media and image_description:
             chat_history = ChatHistory(
                 session_id=session.scene.id,
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + image_description,
                 user_name=user_name or "",
-                media_id=existing_media.media_id,
+                media_id=media_obj.media_id,
             )
             db_session.add(chat_history)
 
-        await db_session.commit()
-
-    except IntegrityError:
-        # 处理并发插入冲突
-        await db_session.rollback()
-        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
-
-        if existing_media:
-            existing_media.references += 1
-            chat_history = ChatHistory(
-                session_id=session.scene.id,
-                user_id=session.user.id,
-                content_type=content_type,
-                content=content + existing_media.description,
-                user_name=user_name or "",
-                media_id=existing_media.media_id,
-            )
-            db_session.add(chat_history)
         await db_session.commit()
 
     except Exception as e:
@@ -1623,14 +827,65 @@ async def process_image_message(
         await db_session.rollback()
 
 
+def _clean_gate_text(content: str) -> str:
+    lines = []
+    for raw_line in (content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("id:") or line.startswith("回复id:"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 async def handle_reply_logic(
     db_session,
     session: Uninfo,
+    bot_name: str,
     user_id: str,
     user_name: str | None,
+    is_tome: bool,
 ):
     """处理回复逻辑"""
     try:
+        # 非 @bot / 非明确点名时，先做一次轻量前置判断，避免频繁启动主 Agent。
+        recent_msgs = (
+            await db_session.execute(
+                Select(ChatHistory)
+                .where(ChatHistory.session_id == session.scene.id)
+                .order_by(ChatHistory.msg_id.desc())
+                .limit(3)
+            )
+        ).scalars().all()
+        recent_msgs = recent_msgs[::-1]
+
+        if not recent_msgs:
+            return
+
+        history_summary = ""
+        for msg in recent_msgs:
+            if msg.content_type == "image":
+                history_summary += f"{msg.user_name}: [发送了一张图片]\n"
+            else:
+                history_summary += f"{msg.user_name}: {_clean_gate_text(msg.content)}\n"
+
+        current_msg_text = (
+            _clean_gate_text(recent_msgs[-1].content)
+            if recent_msgs[-1].content_type == "text"
+            else "[图片]"
+        )
+
+        if not is_tome:
+            should_reply = await check_if_should_reply(
+                history_summary,
+                current_msg_text,
+                bot_name,
+            )
+            if not should_reply:
+                logger.debug(f"前置判断拒绝回复 session={session.scene.id}")
+                return
+
         # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
         last_msg = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session.scene.id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(20))).scalars().all()
@@ -1731,7 +986,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
 
 @scheduler.scheduled_job("interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat")
 async def vectorize_message_history():
-    if not _is_enabled():
+    if not _is_enabled() or not DB.enabled:
         return
     async with get_session() as db_session:
         session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
@@ -1750,58 +1005,81 @@ async def vectorize_message_history():
                 continue
 
 
-@scheduler.scheduled_job("interval", minutes=10, max_instances=1, coalesce=True, id="seedance_temp_gc")
-async def seedance_temp_gc_job():
-    _cleanup_seedance_temp_expired_once()
-
-
 @scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media")
 async def vectorize_media():
-    if not _is_enabled():
+    if not _is_enabled() or not DB.enabled:
         return
-    async with get_session() as db_session:
-        medias_res = await db_session.execute(Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)))
-        medias = medias_res.scalars().all()
-        logger.info(f"待向量化媒体数量: {len(medias)}")
+    if multimodal_model is None:
+        logger.warning("未配置 multimodal_model，跳过媒体向量化")
+        return
 
-        for media in medias:
+    async with get_session() as db_session:
+        medias_res = await db_session.execute(
+            Select(MediaStorage).where(
+                MediaStorage.references >= 3,
+                MediaStorage.vectorized.is_(False),
+                MediaStorage.blocked.is_(False),
+            )
+        )
+        media_ids = [media.media_id for media in medias_res.scalars().all()]
+        logger.info(f"待向量化媒体数量: {len(media_ids)}")
+
+        for media_id in media_ids:
+            media = await db_session.get(MediaStorage, media_id)
+            if media is None:
+                continue
             try:
                 file_path = pic_dir / media.file_path
                 if not file_path.exists():
                     logger.warning(f"文件不存在: {file_path}")
                     media.vectorized = True
                     db_session.add(media)
+                    await db_session.commit()
                     continue
 
-                # 判断是否适合作为表情包
-                vlm_res = await image_vl(file_path, "请判断这张图适不适合作为表情包，只回答是或否")
-                if not vlm_res or vlm_res != "是":
+                is_meme, description = await _analyze_meme_image(file_path)
+                if is_meme is None:
+                    logger.warning(f"图片分析失败，保留待重试状态 media_id={media.media_id}")
+                    continue
+
+                if not is_meme:
                     media.vectorized = True
                     db_session.add(media)
+                    await db_session.commit()
+                    logger.info(f"图片 {media.media_id} 被判定为非表情包，跳过向量化")
                     continue
 
-                try:
-                    await MilvusOP.insert_media(media.media_id, [str(file_path)])
-                    media.vectorized = True
-                    db_session.add(media)
-                    logger.info("向量化成功")
-                except Exception as e:
-                    logger.error(f"向量化插入失败 {media.media_id}: {e}")
-                    # don't mark as vectorized so it can retry later
-                    continue
+                if description:
+                    media.description = description
 
+                await DB.insert_media(
+                    media.media_id,
+                    [str(file_path)],
+                    description=media.description or description or "[图片]",
+                    file_path=str(file_path),
+                    blocked=bool(media.blocked),
+                )
+                media.vectorized = True
+                db_session.add(media)
+                await db_session.commit()
+                logger.info(f"媒体向量化成功 media_id={media.media_id}")
             except Exception as e:
                 logger.error(f"处理媒体 {getattr(media, 'media_id', 'unknown')} 失败: {e}")
+                await db_session.rollback()
                 continue
 
-        await db_session.commit()
         logger.info("向量化媒体完成")
 
 
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with get_session() as db_session:
-        result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=15)))
+        result = await db_session.execute(
+            Select(MediaStorage).where(
+                MediaStorage.references < 3,
+                MediaStorage.created_at < datetime.datetime.now() - datetime.timedelta(days=15),
+            )
+        )
         medias = result.scalars().all()
 
         if not medias:
@@ -1822,9 +1100,99 @@ async def clear_cache_pic():
 
         for media in records_to_delete:
             try:
+                if DB.enabled:
+                    try:
+                        await DB.delete_media(int(media.media_id))
+                    except Exception as e:
+                        logger.warning(f"删除 Qdrant 媒体向量失败 media_id={media.media_id}: {e}")
                 await db_session.delete(media)
             except Exception as e:
                 logger.error(f"删除数据库记录失败 {getattr(media, 'media_id', 'unknown')}: {e}")
 
         await db_session.commit()
         logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
+
+
+async def _update_single_group_memory(db_session: async_scoped_session, session_id: str) -> None:
+    stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+    record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    total_count = (
+        await db_session.execute(
+            Select(sqlfunc.count(ChatHistory.msg_id)).where(ChatHistory.session_id == session_id)
+        )
+    ).scalar_one()
+    last_count = record.msg_count_at_last_update if record else 0
+    new_msg_count = total_count - last_count
+
+    if record and new_msg_count < 100:
+        time_since = datetime.datetime.now() - record.updated_at
+        if time_since.total_seconds() < 6 * 3600:
+            logger.info(f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条）")
+            return
+
+    cutoff = record.updated_at if record else datetime.datetime.min
+    recent_msgs = (
+        await db_session.execute(
+            Select(ChatHistory)
+            .where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.created_at > cutoff,
+                ChatHistory.content_type.in_(["text", "bot", "image"]),
+            )
+            .order_by(ChatHistory.created_at)
+            .limit(200)
+        )
+    ).scalars().all()
+    if not recent_msgs:
+        return
+
+    chat_text = "\n".join(
+        f"[{msg.created_at.strftime('%m-%d %H:%M')}] {msg.user_name}: {msg.content[:120]}"
+        for msg in recent_msgs
+    )
+
+    existing_summary = record.summary if record else ""
+    new_summary = await _call_summary_model(existing_summary, chat_text)
+    if not new_summary:
+        return
+
+    if not record:
+        record = GroupMemory(
+            session_id=session_id,
+            summary=new_summary,
+            msg_count_at_last_update=total_count,
+        )
+        db_session.add(record)
+    else:
+        record.summary = new_summary
+        record.msg_count_at_last_update = total_count
+
+    await db_session.commit()
+    logger.info(f"群体认知档案更新成功 session_id={session_id}")
+
+
+@scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory")
+async def update_group_memory():
+    if not _is_enabled() or summary_model is None:
+        return
+
+    async with get_session() as db_session:
+        time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
+        stmt = Select(ChatHistory.session_id.distinct()).where(ChatHistory.created_at > time_threshold)
+        session_ids = (await db_session.execute(stmt)).scalars().all()
+
+    if not session_ids:
+        return
+
+    sem = asyncio.Semaphore(5)
+
+    async def _update_one(session_id: str) -> None:
+        async with sem:
+            async with get_session() as db_session:
+                try:
+                    await _update_single_group_memory(db_session, session_id)
+                except Exception as e:
+                    logger.error(f"更新群体认知档案失败 session_id={session_id}: {e}")
+
+    await asyncio.gather(*[_update_one(session_id) for session_id in session_ids])

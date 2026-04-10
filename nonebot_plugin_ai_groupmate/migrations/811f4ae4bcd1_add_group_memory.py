@@ -1,0 +1,50 @@
+"""add group memory
+
+迁移 ID: 811f4ae4bcd1
+父迁移: e1a6f4d3c2b8
+创建时间: 2026-04-10 10:30:00.000000
+
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+
+revision: str = "811f4ae4bcd1"
+down_revision: str | Sequence[str] | None = "e1a6f4d3c2b8"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade(name: str = "") -> None:
+    if name:
+        return
+
+    op.create_table(
+        "nonebot_plugin_ai_groupmate_groupmemory",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("session_id", sa.String(), nullable=False),
+        sa.Column("summary", sa.String(), nullable=False),
+        sa.Column("msg_count_at_last_update", sa.Integer(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_nonebot_plugin_ai_groupmate_groupmemory")),
+        info={"bind_key": "nonebot_plugin_ai_groupmate"},
+    )
+    with op.batch_alter_table("nonebot_plugin_ai_groupmate_groupmemory", schema=None) as batch_op:
+        batch_op.create_index(batch_op.f("ix_nonebot_plugin_ai_groupmate_groupmemory_session_id"), ["session_id"], unique=True)
+        batch_op.create_index(batch_op.f("ix_nonebot_plugin_ai_groupmate_groupmemory_updated_at"), ["updated_at"], unique=False)
+
+
+def downgrade(name: str = "") -> None:
+    if name:
+        return
+
+    with op.batch_alter_table("nonebot_plugin_ai_groupmate_groupmemory", schema=None) as batch_op:
+        batch_op.drop_index(batch_op.f("ix_nonebot_plugin_ai_groupmate_groupmemory_updated_at"))
+        batch_op.drop_index(batch_op.f("ix_nonebot_plugin_ai_groupmate_groupmemory_session_id"))
+
+    op.drop_table("nonebot_plugin_ai_groupmate_groupmemory")

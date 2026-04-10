@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, String, Boolean, Float, UniqueConstraint
+from sqlalchemy import JSON, String, Boolean, Float, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 from .favorability import status_desc_from_raw
@@ -42,6 +42,10 @@ class ChatHistory(Model):
     media_id: Mapped[int | None]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
+    __table_args__ = (
+        Index("ix_chat_session_time", "session_id", "created_at"),
+    )
+
 
 class UserRelation(Model):
     """用户关系/好感度表"""
@@ -57,9 +61,10 @@ class UserRelation(Model):
     state: Mapped[str] = mapped_column(String(32), default="normal", index=True)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     daily_gain_used: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_loss_used: Mapped[float] = mapped_column(Float, default=0.0)
     daily_bypass_used: Mapped[float] = mapped_column(Float, default=0.0)
     daily_gain_bank: Mapped[float] = mapped_column(Float, default=0.0)
-    daily_cap: Mapped[float] = mapped_column(Float, default=7.0)
+    daily_cap: Mapped[float] = mapped_column(Float, default=70.0)
     cap_reset_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
     last_interact_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
     last_penalty_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -69,6 +74,16 @@ class UserRelation(Model):
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
         return status_desc_from_raw(self.favorability_raw)
+
+
+class GroupMemory(Model):
+    """群体认知档案（每群一条记录）"""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(unique=True, index=True)
+    summary: Mapped[str] = mapped_column(default="")
+    msg_count_at_last_update: Mapped[int] = mapped_column(default=0)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
 
 
 class ChatHistorySchema(BaseModel):

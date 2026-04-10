@@ -24,13 +24,18 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.orm.session import Session
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.agents.structured_output import ToolStrategy
 
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
+try:
+    from langchain.agents.middleware import ToolCallLimitMiddleware
+except Exception:
+    ToolCallLimitMiddleware = None
+
+from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
 from ..favorability import apply_monika_favorability_change
-from ..milvus import MilvusOP
+from ..memory import DB
 
 require("nonebot_plugin_localstore")
 
@@ -74,6 +79,59 @@ class ResponseMessage(BaseModel):
         return value
 
 
+reply_gate_model = ChatOpenAI(
+    model=plugin_config.openai_model,
+    api_key=SecretStr(plugin_config.openai_token),
+    base_url=plugin_config.openai_base_url,
+    temperature=0,
+)
+
+
+async def check_if_should_reply(
+    history_summary: str,
+    current_msg: str,
+    bot_name: str,
+) -> bool:
+    """
+    在进入主 Agent 前，快速判断普通群聊消息是否值得回复。
+    """
+    system_prompt = f"""
+你是一个群聊消息过滤器。你的任务是判断群内的最新消息是否需要机器人 "{bot_name}" 进行回复。
+
+判断规则：
+1. 如果用户明显在向 "{bot_name}" 提问、求助、打招呼、点名、追问上下文，返回 YES。
+2. 如果消息只是群友之间的普通闲聊、刷屏、表情、无关内容，返回 NO。
+3. 如果不确定，返回 NO。
+
+请仅输出 YES 或 NO，不要输出任何其他内容。
+"""
+    input_text = (
+        f"【最近上下文】\n{history_summary}\n\n"
+        f"【最新消息】\n{current_msg}\n\n"
+        "请判断是否需要机器人回复："
+    )
+
+    try:
+        resp = await asyncio.wait_for(
+            reply_gate_model.ainvoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=input_text),
+                ]
+            ),
+            timeout=15.0,
+        )
+        content = resp.content if isinstance(resp.content, str) else ""
+        normalized = content.strip().upper().replace(".", "").replace("。", "")
+        return normalized == "YES"
+    except asyncio.TimeoutError:
+        logger.warning("前置判断超时，默认不回复")
+        return False
+    except Exception as e:
+        logger.error(f"前置判断失败: {e}")
+        return False
+
+
 # 如果想封装成自定义的 @tool，可以这样写:
 @tool("search_web")
 async def search_web(query: str) -> str:
@@ -97,18 +155,20 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
 
-        # Fast probe to avoid hanging the agent when Milvus (or the tunnel) is unavailable.
-        try:
-            client = MilvusOP._get_async_client()
-            try:
-                await asyncio.wait_for(client.list_collections(), timeout=2.0)
-            except AttributeError:
-                await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-        except Exception as e:
-            logger.error(f"RAG skipped (Milvus unavailable): {e}")
-            return '未找到相关历史记录'
+        if not DB.enabled:
+            return "未找到相关历史记录"
 
-        similar_msgs = await asyncio.wait_for(MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"'), timeout=8.0)
+        search_res = await asyncio.wait_for(
+            DB.search(
+                [query],
+                search_filter=f'session_id == "{runtime.context.session_id}"',
+                with_meta=True,
+            ),
+            timeout=15.0,
+        )
+        similar_msgs = search_res.get("texts", []) if isinstance(search_res, dict) else (search_res or [])
+        vector_ids = search_res.get("vector_ids", []) if isinstance(search_res, dict) else []
+        logger.info(f"RAG 搜索命中向量ID session_id={runtime.context.session_id} vector_ids={vector_ids}")
         return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
 
     except asyncio.TimeoutError:
@@ -369,7 +429,7 @@ def create_similar_meme_tool(db_session, session_id: str):
             if msg.content_type != "image":
                 # 如果不是图片，尝试用文本内容去搜图片（也是一种玩法）
                 description = msg.content
-                pic_ids = await MilvusOP.search_media([description])
+                pic_ids = await DB.search_media([description])
             else:
                 # 如果是图片，ChatHistory.content 存的就是描述
                 description = msg.content
@@ -378,7 +438,7 @@ def create_similar_meme_tool(db_session, session_id: str):
                 )
                 result = await db_session.execute(stmt)
                 msg = result.scalar_one_or_none()
-                pic_ids = await MilvusOP.search_media_by_pic([str(pic_dir / msg.file_path)])
+                pic_ids = await DB.search_media_by_pic([str(pic_dir / msg.file_path)])
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
                 return "没有搜索到相似图片"
@@ -485,7 +545,7 @@ def create_search_meme_tool(db_session):
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await MilvusOP.search_media([description])
+            pic_ids = await DB.search_media([description])
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
@@ -610,78 +670,6 @@ def create_send_meme_tool(db_session, session_id: str):
     return send_meme_image
 
 
-def create_seedance_image_test_tool(user_id: str | None, session_id: str):
-    """
-    创建 Seedance 生图测试工具（仅白名单用户可调用）。
-    当前仅用于验证白名单逻辑，不会真实调用第三方生成接口。
-    """
-
-    @tool("seedance_generate_image_test")
-    async def seedance_generate_image_test(prompt: str) -> str:
-        """
-        测试 Seedance 生图权限控制。
-
-        参数:
-        - prompt: 生图提示词（测试用）
-        返回:
-        - JSON 字符串，包含是否授权、调用者和模拟任务ID
-        """
-        caller = str(user_id).strip() if user_id else ""
-        request_id = f"seedance_req_{int(datetime.datetime.now().timestamp())}_{random.randint(1000, 9999)}"
-        whitelist = {str(i).strip() for i in plugin_config.seedance_tool_whitelist if str(i).strip()}
-
-        logger.info(
-            f"[SeedanceAudit] request_id={request_id} caller={caller or 'unknown'} "
-            f"session_id={session_id} whitelist_size={len(whitelist)} prompt={prompt}"
-        )
-
-        if not whitelist:
-            logger.warning(f"[SeedanceAudit] request_id={request_id} auth_passed=false reason=empty_whitelist")
-            return json.dumps(
-                {
-                    "success": False,
-                    "request_id": request_id,
-                    "auth_passed": False,
-                    "reason": "seedance_tool_whitelist 为空，已拒绝调用",
-                    "caller": caller or "unknown",
-                },
-                ensure_ascii=False,
-            )
-
-        if caller not in whitelist:
-            logger.warning(f"Seedance tool denied: caller={caller or 'unknown'}")
-            logger.warning(f"[SeedanceAudit] request_id={request_id} auth_passed=false reason=caller_not_in_whitelist")
-            return json.dumps(
-                {
-                    "success": False,
-                    "request_id": request_id,
-                    "auth_passed": False,
-                    "reason": "权限不足，当前QQ不在 Seedance 白名单中",
-                    "caller": caller or "unknown",
-                },
-                ensure_ascii=False,
-            )
-
-        task_id = f"seedance_test_{int(datetime.datetime.now().timestamp())}"
-        logger.info(f"Seedance tool allowed: caller={caller}, task_id={task_id}, prompt={prompt}")
-        logger.success(f"[SeedanceAudit] request_id={request_id} auth_passed=true caller={caller} task_id={task_id}")
-        return json.dumps(
-            {
-                "success": True,
-                "request_id": request_id,
-                "auth_passed": True,
-                "mode": "test_only",
-                "task_id": task_id,
-                "caller": caller,
-                "prompt": prompt,
-                "message": "白名单校验通过。该工具当前为测试模式，尚未调用真实 Seedance API。",
-            },
-            ensure_ascii=False,
-        )
-
-    return seedance_generate_image_test
-
-
 @tool("calculate_expression")
 def calculate_expression(expression: str) -> str:
     """
@@ -714,7 +702,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
         当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
 
         参数:
-        - score_change: 好感度意图变化值（正数加分，负数扣分）。常规建议 -8~+8，明显事件可用 -15~+15，极端上限 -30~+30；最终实际变化会被状态、日上限、bank、道歉衰减等规则二次调整。
+        - score_change: 好感度意图变化值（raw 单位，正数加分，负数扣分）。常规建议 -20~+20，极端上限 -50~+50；最终实际变化会被状态、日上限、bank、道歉衰减等规则二次调整。
         - reason: 变更原因（必填）。
         - add_tags: 需要新增的印象标签列表。例如 ["爱玩原神", "很幽默"]。
         - remove_tags: 需要移除的旧标签列表（用于修正印象或删除错误的标签）。例如 ["内向"]。
@@ -748,6 +736,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
                 reason=reason,
                 now=datetime.datetime.now(),
                 daily_gain_used=relation.daily_gain_used,
+                daily_loss_used=relation.daily_loss_used,
                 daily_bypass_used=relation.daily_bypass_used,
                 daily_gain_bank=relation.daily_gain_bank,
                 daily_cap=relation.daily_cap,
@@ -759,6 +748,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             relation.favorability_raw = transition.new_raw
             relation.state = transition.state_after
             relation.daily_gain_used = transition.daily_gain_used_after
+            relation.daily_loss_used = transition.daily_loss_used_after
             relation.daily_bypass_used = transition.daily_bypass_used_after
             relation.daily_gain_bank = transition.daily_gain_bank_after
             relation.daily_cap = transition.daily_cap_after
@@ -788,7 +778,8 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             # 赋值回数据库对象
             relation.tags = current_tags
             relation.user_name = user_name or ""  # 同步更新昵称
-            favorability = relation.favorability
+            favorability = transition.new_score
+            favorability_raw = transition.new_raw
 
             await db_session.commit()
 
@@ -798,9 +789,11 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
                 tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
 
             meta = (
-                f"请求变化 {transition.requested_change:+d}, 应用变化 {transition.applied_change:+d}, "
+                f"请求变化 raw {transition.requested_change_raw:+d} (映射 {transition.requested_change:+d}), "
+                f"应用变化 raw {transition.applied_change_raw:+d} (映射 {transition.applied_change:+d}), "
                 f"状态 {transition.state_before}->{transition.state_after}, "
-                f"cap {transition.daily_gain_used_after:.1f}/{transition.daily_cap_after:.1f}, "
+                f"gain_cap {transition.daily_gain_used_after:.1f}/{transition.daily_cap_after:.1f}, "
+                f"loss_cap {transition.daily_loss_used_after:.1f}/{transition.daily_cap_after:.1f}, "
                 f"bypass {transition.daily_bypass_used_after:.1f}, bank {transition.daily_gain_bank_after:.1f}"
             )
             if transition.notes:
@@ -808,7 +801,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             log_msg = f"好感度 {old_score}->{favorability}{tag_msg} ({meta}) (原因: {reason})"
             logger.info(f"用户[{user_name}]画像更新: {log_msg}")
 
-            return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+            return f"画像已更新。当前好感度(映射/原始): {favorability}/{favorability_raw}，当前标签: {current_tags}"
 
         except Exception as e:
             logger.error(f"关系更新失败: {e}")
@@ -861,7 +854,7 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
 1. 如果对方的表现符合现有标签，无需操作。
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
-4. **关于好感度评分**：请基于**本次对话内容质量**给出 `score_change`（这是意图变化，不是最终变化）。常规用小幅分值（如 -8~+8），明显事件可中幅（-15~+15），只有极端事件才给到 ±30。即使当前关系很差，只要这次表现好，也应给正向分。
+4. **关于好感度评分**：请基于**本次对话内容质量**给出 `score_change`（这是 raw 意图变化，不是最终变化）。常规用小幅分值（如 -20~+20），只有极端事件才给到 ±50。即使当前关系很差，只要这次表现好，也应给正向分。
 {strategy}
 """
     except Exception as e:
@@ -869,9 +862,29 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return ""
 
 
+async def get_group_context(db_session, session_id: str) -> str:
+    """获取群体认知档案 Prompt"""
+    try:
+        stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+        record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+        if not record or not (record.summary or "").strip():
+            return ""
+
+        return f"""
+【群体认知档案】
+{record.summary}
+（档案更新于 {record.updated_at.strftime("%Y-%m-%d %H:%M")}）
+"""
+    except Exception as e:
+        logger.error(f"获取群体档案失败: {e}")
+        return ""
+
+
 async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    group_context = await get_group_context(db_session, session_id)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
@@ -886,6 +899,8 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
    - “不要在群里做题啊喂”
    - 或者直接发个表情包略过。
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+
+{group_context}
 
 {relation_context}
 
@@ -928,12 +943,9 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
    - 调用 `search_similar_meme_by_id(target_msg_id="xxxxx")`。
    - 根据返回结果，选择一张合适的，再调用 `send_meme_image` 发送。
 
-【Seedance 生图】
-生图请求由插件主流程处理，不在 Agent 工具中调用。
-
 【RAG 工具使用规则】
 
-RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
+RAG 搜索结果特性：搜索结果已经经过向量检索与 rerank 排序，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
 搜索目的：rag_search 主要用于：
 了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
 确保对话连贯性，回顾某个特定时间点发生过的讨论。
@@ -990,9 +1002,33 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             report_tool,
         ]
 
-    agent = create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context)
+    middleware = None
+    if ToolCallLimitMiddleware is not None:
+        try:
+            middleware = [
+                ToolCallLimitMiddleware(run_limit=8),
+                ToolCallLimitMiddleware(tool_name="reply_user", run_limit=1),
+                ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=1),
+            ]
+        except Exception as e:
+            logger.warning(f"当前 LangChain middleware 参数不兼容，跳过工具限流: {e}")
+            middleware = None
 
-    return agent
+    try:
+        if middleware:
+            return create_agent(
+                model,
+                tools=tools,
+                system_prompt=system_prompt,
+                context_schema=Context,
+                middleware=middleware,
+            )
+    except TypeError:
+        logger.warning("当前 LangChain 版本不支持 agent middleware，跳过工具限流")
+    except Exception as e:
+        logger.warning(f"Agent middleware 初始化失败，跳过工具限流: {e}")
+
+    return create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context)
 
 
 def format_chat_history(history: list[ChatHistorySchema]) -> list:
