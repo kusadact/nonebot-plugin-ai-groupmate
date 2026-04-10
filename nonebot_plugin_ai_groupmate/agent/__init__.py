@@ -33,7 +33,7 @@ except Exception:
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
-from ..favorability import apply_monika_favorability_change
+from ..favorability import apply_favorability_change_detailed
 from ..memory import DB
 
 require("nonebot_plugin_localstore")
@@ -756,7 +756,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
 
             # 2. 处理好感度
             old_score = relation.favorability
-            transition = apply_monika_favorability_change(
+            transition = apply_favorability_change_detailed(
                 old_score=old_score,
                 old_raw=relation.favorability_raw,
                 requested_change=score_change,
