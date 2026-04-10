@@ -29,7 +29,6 @@ require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
 from sqlalchemy import Select, desc, func as sqlfunc
-from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
@@ -64,6 +63,10 @@ with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
 _DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+class PermanentMultimodalError(Exception):
+    """Provider rejected the media request and retrying will not help."""
 
 
 def _pick_api_key(*values: str) -> str:
@@ -158,6 +161,20 @@ def _image_to_data_uri(file_path: Path) -> str:
     return f"data:{mime_type};base64,{payload}"
 
 
+def _is_permanent_multimodal_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "error code: 400",
+            "status code: 400",
+            "http 400",
+            "400 bad request",
+            "status=400",
+        )
+    )
+
+
 async def _call_multimodal_model(prompt: str, file_path: Path, timeout_s: float = 90.0) -> str | None:
     if multimodal_model is None:
         return None
@@ -183,6 +200,9 @@ async def _call_multimodal_model(prompt: str, file_path: Path, timeout_s: float 
         logger.warning(f"多模态模型调用超时: {file_path}")
         return None
     except Exception as e:
+        if _is_permanent_multimodal_error(e):
+            logger.warning(f"多模态模型返回不可重试错误 {file_path}: {e}")
+            raise PermanentMultimodalError(str(e)) from e
         logger.error(f"多模态模型调用失败 {file_path}: {e}")
         return None
 
@@ -192,7 +212,10 @@ async def _describe_image_short(file_path: Path) -> str:
         "请用一句中文简短描述这张图片，保留主体和情绪信息，"
         "不要编造细节，不要超过30个字，只输出描述本身。"
     )
-    result = await _call_multimodal_model(prompt, file_path, timeout_s=60.0)
+    try:
+        result = await _call_multimodal_model(prompt, file_path, timeout_s=60.0)
+    except PermanentMultimodalError:
+        return "[图片]"
     if not result:
         return "[图片]"
     result = _strip_code_fence(result).replace("\n", " ").strip()
@@ -791,10 +814,11 @@ async def process_image_message(
                     )
                     db_session.add(media_obj)
                     await db_session.flush()
-            except IntegrityError:
+            except Exception:
                 media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
                 if media_obj is None:
                     raise
+                logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
                 media_obj.references += 1
                 db_session.add(media_obj)
 
@@ -1037,7 +1061,14 @@ async def vectorize_media():
                     await db_session.commit()
                     continue
 
-                is_meme, description = await _analyze_meme_image(file_path)
+                try:
+                    is_meme, description = await _analyze_meme_image(file_path)
+                except PermanentMultimodalError as e:
+                    logger.warning(f"图片分析返回不可重试错误，跳过 media_id={media.media_id}: {e}")
+                    media.vectorized = True
+                    db_session.add(media)
+                    await db_session.commit()
+                    continue
                 if is_meme is None:
                     logger.warning(f"图片分析失败，保留待重试状态 media_id={media.media_id}")
                     continue
