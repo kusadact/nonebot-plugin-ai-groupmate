@@ -38,8 +38,6 @@ def _image_to_base64(image_input: str) -> str:
 class RemoteModelClient:
     def __init__(
         self,
-        base_url: str = "",
-        api_key: str = "",
         embedding_base_url: str = "",
         embedding_api_key: str = "",
         embedding_model: str = "",
@@ -56,12 +54,7 @@ class RemoteModelClient:
         media_rerank_base_url: str = "",
         media_rerank_api_key: str = "",
         media_rerank_model: str = "",
-        clip_base_url: str = "",
-        clip_api_key: str = "",
     ):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-
         self.embedding_base_url = embedding_base_url.rstrip("/")
         self.embedding_api_key = embedding_api_key
         self.embedding_model = embedding_model
@@ -81,9 +74,6 @@ class RemoteModelClient:
         self.media_rerank_base_url = media_rerank_base_url.rstrip("/")
         self.media_rerank_api_key = media_rerank_api_key
         self.media_rerank_model = media_rerank_model
-
-        self.clip_base_url = clip_base_url.rstrip("/")
-        self.clip_api_key = clip_api_key
 
     def _post_json_with_base(self, base_url: str, path: str, payload: dict[str, Any], api_key: str = "") -> dict[str, Any]:
         if not base_url:
@@ -107,11 +97,6 @@ class RemoteModelClient:
         except urllib.error.URLError as e:
             raise RuntimeError(f"remote request failed: {e}") from e
         return json.loads(body)
-
-    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.base_url:
-            raise RuntimeError("remote_model_base_url is empty")
-        return self._post_json_with_base(self.base_url, path, payload, self.api_key)
 
     @staticmethod
     def _normalize_embeddings_response(data: dict[str, Any]) -> dict[str, list[Any]]:
@@ -212,88 +197,81 @@ class RemoteModelClient:
                 self.media_embedding_base_url,
                 "",
                 payload,
-                self.media_embedding_api_key or self.api_key,
+                self.media_embedding_api_key,
             )
             dense.extend(self._normalize_dashscope_embeddings_response(data)["dense"])
         return {"dense": dense}
 
-    def _post_clip_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        clip_base = self.clip_base_url or self.base_url
-        clip_key = self.clip_api_key or self.api_key
-        if not clip_base:
-            raise RuntimeError("remote_clip_base_url is empty")
-        return self._post_json_with_base(clip_base, path, payload, clip_key)
-
     def embed_documents(self, texts: list[str]) -> dict[str, list[Any]]:
-        if self.embedding_base_url:
-            return self._post_embeddings(
-                self.embedding_base_url,
-                self.embedding_api_key or self.api_key,
-                self.embedding_model,
-                texts,
-                self.embedding_dimensions,
-            )
-        return self._post_json("/embed", {"texts": texts})
+        if not self.embedding_base_url:
+            raise RuntimeError("remote_embedding_base_url is empty")
+        return self._post_embeddings(
+            self.embedding_base_url,
+            self.embedding_api_key,
+            self.embedding_model,
+            texts,
+            self.embedding_dimensions,
+        )
 
     def rerank(self, query: str, texts: list[str]) -> dict[str, list[dict[str, Any]]]:
-        if self.rerank_base_url:
-            if not self.rerank_model:
-                raise RuntimeError("remote_rerank_model is empty")
-            payload = {
-                "model": self.rerank_model,
-                "query": query,
-                "documents": texts,
-                "top_n": len(texts),
-                "return_documents": True,
-            }
-            data = self._post_json_with_base(
-                self.rerank_base_url,
-                "/rerank",
-                payload,
-                self.rerank_api_key or self.api_key,
-            )
-            normalized = []
-            for item in self._normalize_rerank_results(data, texts).get("results", []):
-                doc = item.get("document")
-                text = doc if isinstance(doc, str) else ""
-                if isinstance(doc, dict):
-                    text = doc.get("text", "")
-                normalized.append({"text": text, "score": item["score"], "index": item.get("index")})
-            return {"results": normalized}
-        return self._post_json("/rerank", {"query": query, "texts": texts})
+        if not self.rerank_base_url:
+            raise RuntimeError("remote_rerank_base_url is empty")
+        if not self.rerank_model:
+            raise RuntimeError("remote_rerank_model is empty")
+        payload = {
+            "model": self.rerank_model,
+            "query": query,
+            "documents": texts,
+            "top_n": len(texts),
+            "return_documents": True,
+        }
+        data = self._post_json_with_base(
+            self.rerank_base_url,
+            "/rerank",
+            payload,
+            self.rerank_api_key,
+        )
+        normalized = []
+        for item in self._normalize_rerank_results(data, texts).get("results", []):
+            doc = item.get("document")
+            text = doc if isinstance(doc, str) else ""
+            if isinstance(doc, dict):
+                text = doc.get("text", "")
+            normalized.append({"text": text, "score": item["score"], "index": item.get("index")})
+        return {"results": normalized}
 
     @staticmethod
     def _build_image_input(image_base64: str) -> list[dict[str, str]]:
         return [{"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"}]
 
     def embed_media_texts(self, texts: list[str]) -> dict[str, list[Any]]:
-        if self.media_embedding_base_url:
-            if self.media_embedding_provider == "aliyun_dashscope":
-                items = [{"text": text} for text in texts]
-                return self._post_dashscope_media_embeddings(items)
-            return self._post_embeddings(
-                self.media_embedding_base_url,
-                self.media_embedding_api_key or self.api_key,
-                self.media_embedding_model,
-                texts,
-                self.media_embedding_dimensions,
-            )
-        return self._post_clip_json("/clip/text", {"texts": texts})
+        if not self.media_embedding_base_url:
+            raise RuntimeError("remote_media_embedding_base_url is empty")
+        if self.media_embedding_provider == "aliyun_dashscope":
+            items = [{"text": text} for text in texts]
+            return self._post_dashscope_media_embeddings(items)
+        return self._post_embeddings(
+            self.media_embedding_base_url,
+            self.media_embedding_api_key,
+            self.media_embedding_model,
+            texts,
+            self.media_embedding_dimensions,
+        )
 
     def embed_media_images_base64(self, images_base64: list[str]) -> dict[str, list[Any]]:
-        if self.media_embedding_base_url:
-            if self.media_embedding_provider == "aliyun_dashscope":
-                items = [{"image": self._to_dashscope_image(f"data:image/png;base64,{item}")} for item in images_base64]
-                return self._post_dashscope_media_embeddings(items)
-            inputs = [self._build_image_input(item) for item in images_base64]
-            return self._post_embeddings(
-                self.media_embedding_base_url,
-                self.media_embedding_api_key or self.api_key,
-                self.media_embedding_model,
-                inputs,
-                self.media_embedding_dimensions,
-            )
-        return self._post_clip_json("/clip/image", {"images_base64": images_base64})
+        if not self.media_embedding_base_url:
+            raise RuntimeError("remote_media_embedding_base_url is empty")
+        if self.media_embedding_provider == "aliyun_dashscope":
+            items = [{"image": self._to_dashscope_image(f"data:image/png;base64,{item}")} for item in images_base64]
+            return self._post_dashscope_media_embeddings(items)
+        inputs = [self._build_image_input(item) for item in images_base64]
+        return self._post_embeddings(
+            self.media_embedding_base_url,
+            self.media_embedding_api_key,
+            self.media_embedding_model,
+            inputs,
+            self.media_embedding_dimensions,
+        )
 
     def has_media_rerank(self) -> bool:
         return bool(self.media_rerank_base_url)
@@ -359,7 +337,7 @@ class RemoteModelClient:
                 self.media_rerank_base_url,
                 "",
                 payload,
-                self.media_rerank_api_key or self.api_key,
+                self.media_rerank_api_key,
             )
             return self._normalize_dashscope_rerank_results(data, dashscope_docs)
 
@@ -374,7 +352,7 @@ class RemoteModelClient:
             self.media_rerank_base_url,
             "/rerank",
             payload,
-            self.media_rerank_api_key or self.api_key,
+            self.media_rerank_api_key,
         )
         return self._normalize_rerank_results(data, documents)
 
@@ -401,8 +379,6 @@ class VectorDBOperator:
             timeout=60,
         )
         self.remote_client = RemoteModelClient(
-            base_url=plugin_config.remote_model_base_url,
-            api_key=plugin_config.remote_model_api_key,
             embedding_base_url=plugin_config.remote_embedding_base_url,
             embedding_api_key=plugin_config.remote_embedding_api_key,
             embedding_model=plugin_config.remote_embedding_model,
@@ -411,16 +387,14 @@ class VectorDBOperator:
             rerank_api_key=plugin_config.remote_rerank_api_key,
             rerank_model=plugin_config.remote_rerank_model,
             media_embedding_provider=plugin_config.remote_media_embedding_provider,
-            media_embedding_base_url=plugin_config.remote_media_embedding_base_url or plugin_config.remote_clip_base_url or plugin_config.remote_model_base_url,
-            media_embedding_api_key=plugin_config.remote_media_embedding_api_key or plugin_config.remote_clip_api_key,
+            media_embedding_base_url=plugin_config.remote_media_embedding_base_url,
+            media_embedding_api_key=plugin_config.remote_media_embedding_api_key,
             media_embedding_model=plugin_config.remote_media_embedding_model,
             media_embedding_dimensions=self.media_vector_dim,
             media_rerank_provider=plugin_config.remote_media_rerank_provider,
-            media_rerank_base_url=plugin_config.remote_media_rerank_base_url or plugin_config.remote_media_embedding_base_url or plugin_config.remote_clip_base_url or plugin_config.remote_model_base_url,
+            media_rerank_base_url=plugin_config.remote_media_rerank_base_url,
             media_rerank_api_key=plugin_config.remote_media_rerank_api_key,
             media_rerank_model=plugin_config.remote_media_rerank_model,
-            clip_base_url=plugin_config.remote_clip_base_url,
-            clip_api_key=plugin_config.remote_clip_api_key,
         )
 
     @staticmethod

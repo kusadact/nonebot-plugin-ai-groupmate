@@ -9,9 +9,6 @@ class ScopedConfig(BaseModel):
     qdrant_api_key: str = ""
     chat_vector_dim: int = 1024
     media_vector_dim: int = 2560
-    # 兼容旧版：远程模型统一入口（/embed /rerank /clip）
-    remote_model_base_url: str = ""
-    remote_model_api_key: str = ""
     # embedding 分路（硅基流动/OpenAI 风格接口）
     remote_embedding_base_url: str = ""
     remote_embedding_api_key: str = ""
@@ -33,9 +30,6 @@ class ScopedConfig(BaseModel):
     remote_media_rerank_base_url: str = ""
     remote_media_rerank_api_key: str = ""
     remote_media_rerank_model: str = ""
-    # 旧版 clip 配置，保留作兼容别名
-    remote_clip_base_url: str = ""
-    remote_clip_api_key: str = ""
     tavily_api_key: str = ""
     qwen_token: str = ""
     summary_model: str = "qwen-flash"
