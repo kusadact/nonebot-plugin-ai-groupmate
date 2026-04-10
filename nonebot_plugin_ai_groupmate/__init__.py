@@ -702,9 +702,12 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         logger.error(f"保存文本消息失败: {e}")
         await db_session.rollback()
 
-    # ========== 步骤2: 处理图片消息（耗时） ==========
+    # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
+    image_content_prefix = f"id: {get_message_id()}\n"
     for img in imgs:
-        await process_image_message(db_session, img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
+        asyncio.create_task(
+            _process_image_task(img, event, bot, state, session, user_name, image_content_prefix)
+        )
 
     plain_text = (msg.extract_plain_text() or event.get_plaintext() or "").strip()
     if await _try_auto_block_replied_meme(
@@ -762,6 +765,22 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         )
 
     await db_session.commit()
+
+
+async def _process_image_task(
+    img: Image,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session: Uninfo,
+    user_name: str | None,
+    content_prefix: str,
+) -> None:
+    try:
+        async with get_session() as db_session:
+            await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix)
+    except Exception as e:
+        logger.error(f"后台处理图片失败: {e}")
 
 
 async def process_image_message(
@@ -1113,10 +1132,6 @@ async def clear_cache_pic():
         )
         medias = result.scalars().all()
 
-        if not medias:
-            logger.info("没有需要清理的媒体文件")
-            return
-
         records_to_delete = []
         for media in medias:
             try:
@@ -1141,7 +1156,26 @@ async def clear_cache_pic():
                 logger.error(f"删除数据库记录失败 {getattr(media, 'media_id', 'unknown')}: {e}")
 
         await db_session.commit()
-        logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
+        if records_to_delete:
+            logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
+        else:
+            logger.info("没有需要清理的媒体文件")
+
+        known_files_result = await db_session.execute(Select(MediaStorage.file_path))
+        known_files = {row[0] for row in known_files_result.all()}
+
+        disk_files = await asyncio.to_thread(lambda: list(pic_dir.iterdir()))
+        orphaned = [file_path for file_path in disk_files if file_path.is_file() and file_path.name not in known_files]
+
+        for file_path in orphaned:
+            try:
+                await asyncio.to_thread(file_path.unlink, True)
+                logger.debug(f"删除孤立文件: {file_path.name}")
+            except Exception as e:
+                logger.error(f"删除孤立文件失败 {file_path.name}: {e}")
+
+        if orphaned:
+            logger.info(f"成功清理 {len(orphaned)} 个孤立文件")
 
 
 async def _update_single_group_memory(db_session: async_scoped_session, session_id: str) -> None:
