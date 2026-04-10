@@ -203,7 +203,7 @@ def _normalize_daily(
     return gain_used, loss_used, bypass_used, cap, reset_at
 
 
-def apply_monika_favorability_change(
+def apply_favorability_change_detailed(
     *,
     old_score: int,
     old_raw: int | None,
@@ -393,7 +393,7 @@ def apply_monika_favorability_change(
 
 def apply_favorability_change(old_score: int, requested_change: int) -> FavorabilityTransition:
     now = datetime.now()
-    return apply_monika_favorability_change(
+    return apply_favorability_change_detailed(
         old_score=old_score,
         old_raw=None,
         requested_change=requested_change,

@@ -1071,8 +1071,10 @@ async def vectorize_media():
             media = await db_session.get(MediaStorage, media_id)
             if media is None:
                 continue
+            current_media_id = int(media_id)
+            current_file_name = media.file_path
             try:
-                file_path = pic_dir / media.file_path
+                file_path = pic_dir / current_file_name
                 if not file_path.exists():
                     logger.warning(f"文件不存在: {file_path}")
                     media.vectorized = True
@@ -1083,38 +1085,39 @@ async def vectorize_media():
                 try:
                     is_meme, description = await _analyze_meme_image(file_path)
                 except PermanentMultimodalError as e:
-                    logger.warning(f"图片分析返回不可重试错误，跳过 media_id={media.media_id}: {e}")
+                    logger.warning(f"图片分析返回不可重试错误，跳过 media_id={current_media_id}: {e}")
                     media.vectorized = True
                     db_session.add(media)
                     await db_session.commit()
                     continue
                 if is_meme is None:
-                    logger.warning(f"图片分析失败，保留待重试状态 media_id={media.media_id}")
+                    logger.warning(f"图片分析失败，保留待重试状态 media_id={current_media_id}")
                     continue
 
                 if not is_meme:
                     media.vectorized = True
                     db_session.add(media)
                     await db_session.commit()
-                    logger.info(f"图片 {media.media_id} 被判定为非表情包，跳过向量化")
+                    logger.info(f"图片 {current_media_id} 被判定为非表情包，跳过向量化")
                     continue
 
                 if description:
                     media.description = description
+                media_description = media.description or description or "[图片]"
 
                 await DB.insert_media(
-                    media.media_id,
+                    current_media_id,
                     [str(file_path)],
-                    description=media.description or description or "[图片]",
+                    description=media_description,
                     file_path=str(file_path),
                     blocked=bool(media.blocked),
                 )
                 media.vectorized = True
                 db_session.add(media)
                 await db_session.commit()
-                logger.info(f"媒体向量化成功 media_id={media.media_id}")
+                logger.info(f"媒体向量化成功 media_id={current_media_id}")
             except Exception as e:
-                logger.error(f"处理媒体 {getattr(media, 'media_id', 'unknown')} 失败: {e}")
+                logger.error(f"处理媒体 {current_media_id} 失败: {e}")
                 await db_session.rollback()
                 continue
 
@@ -1134,26 +1137,28 @@ async def clear_cache_pic():
 
         records_to_delete = []
         for media in medias:
+            current_media_id = int(media.media_id)
+            current_file_name = media.file_path
             try:
-                file_path = Path(pic_dir / media.file_path)
+                file_path = Path(pic_dir / current_file_name)
                 # use pathlib unlink with missing_ok=True to avoid raising if missing
                 await asyncio.to_thread(file_path.unlink, True)
-                records_to_delete.append(media)
+                records_to_delete.append((media, current_media_id, current_file_name))
                 logger.debug(f"删除文件: {file_path}")
             except Exception as e:
-                logger.error(f"删除文件失败 {getattr(media, 'file_path', 'unknown')}: {e}")
-                records_to_delete.append(media)
+                logger.error(f"删除文件失败 {current_file_name}: {e}")
+                records_to_delete.append((media, current_media_id, current_file_name))
 
-        for media in records_to_delete:
+        for media, current_media_id, current_file_name in records_to_delete:
             try:
                 if DB.enabled:
                     try:
-                        await DB.delete_media(int(media.media_id))
+                        await DB.delete_media(current_media_id)
                     except Exception as e:
-                        logger.warning(f"删除 Qdrant 媒体向量失败 media_id={media.media_id}: {e}")
+                        logger.warning(f"删除 Qdrant 媒体向量失败 media_id={current_media_id}: {e}")
                 await db_session.delete(media)
             except Exception as e:
-                logger.error(f"删除数据库记录失败 {getattr(media, 'media_id', 'unknown')}: {e}")
+                logger.error(f"删除数据库记录失败 media_id={current_media_id}, file_path={current_file_name}: {e}")
 
         await db_session.commit()
         if records_to_delete:
