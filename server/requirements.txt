@@ -1,5 +1,0 @@
-fastapi==0.128.0
-Pillow==12.1.0
-pydantic==2.12.5
-torch
-transformers==5.0.0

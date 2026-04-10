@@ -14,7 +14,7 @@ from sqlalchemy import Select, Update
 from nonebot_plugin_orm import AsyncSession
 
 from .model import ChatHistory, ChatHistorySchema
-from .milvus import MilvusOP
+from .memory import DB
 
 
 def generate_file_hash(file_data: bytes) -> str:
@@ -254,7 +254,7 @@ async def process_and_vectorize_session_chats(
         if not batch_contexts:
             continue
 
-        # 3. 批量插入向量到 Milvus（带重试）
+        # 3. 批量插入向量到 Qdrant（带重试）
         try:
             await insert_vectors_with_retry(batch_contexts, session_id)
         except Exception as e:
@@ -309,7 +309,7 @@ async def insert_vectors_with_retry(contexts: list[str], session_id: str, max_re
     """
     for attempt in range(max_retries):
         try:
-            await MilvusOP.batch_insert(contexts, session_id)
+            await DB.batch_insert(contexts, session_id)
             return
         except Exception as e:
             if attempt == max_retries - 1:

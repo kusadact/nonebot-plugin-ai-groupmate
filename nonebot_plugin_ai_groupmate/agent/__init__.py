@@ -15,7 +15,6 @@ from nonebot import require, get_plugin_config
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select, func, extract, desc
-from PIL import Image as PILImage
 
 from nonebot.log import logger
 from langchain.tools import ToolRuntime, tool
@@ -32,10 +31,10 @@ try:
 except Exception:
     ToolCallLimitMiddleware = None
 
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
+from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
 from ..favorability import apply_monika_favorability_change
-from ..milvus import MilvusOP
+from ..memory import DB
 
 require("nonebot_plugin_localstore")
 
@@ -155,19 +154,11 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
 
-        # Fast probe to avoid hanging the agent when Milvus (or the tunnel) is unavailable.
-        try:
-            client = MilvusOP._get_async_client()
-            try:
-                await asyncio.wait_for(client.list_collections(), timeout=2.0)
-            except AttributeError:
-                await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-        except Exception as e:
-            logger.error(f"RAG skipped (Milvus unavailable): {e}")
-            return '未找到相关历史记录'
+        if not DB.enabled:
+            return "未找到相关历史记录"
 
         search_res = await asyncio.wait_for(
-            MilvusOP.search(
+            DB.search(
                 [query],
                 search_filter=f'session_id == "{runtime.context.session_id}"',
                 with_meta=True,
@@ -415,68 +406,96 @@ def create_similar_meme_tool(db_session, session_id: str):
     """
 
     @tool("search_similar_meme_by_id")
-    async def search_similar_meme_by_pic() -> str:
+    async def search_similar_meme_by_pic(target_msg_id: str | None = None) -> str:
         """
-        根据指定的历史最新图片，搜索与之相似的表情包。
+        根据指定的历史图片，搜索与之相似的表情包。
         当用户说“找一张跟这张差不多的”或引用某张图片求相似图时使用。
+        参数：
+        - target_msg_id: 聊天记录中图片消息的 id；不传时默认使用本群最近一张图片。
         """
-        # 1. 清理 ID (防止模型传入 'id:12345' 这种格式)
+        normalized_msg_id = None
+        if target_msg_id:
+            normalized_msg_id = str(target_msg_id).strip()
+            normalized_msg_id = re.sub(r"^id\s*:\s*", "", normalized_msg_id, flags=re.IGNORECASE)
+            normalized_msg_id = normalized_msg_id.strip()
 
-        logger.info(f"正在搜索相似图片...")
+        logger.info(f"正在搜索相似图片... target_msg_id={normalized_msg_id or 'latest'}")
 
         try:
-            # 2. 从 ChatHistory 查找该消息的描述
-            # 注意：这里假设 ChatHistory.msg_id 存的是平台的消息ID
-            stmt = Select(ChatHistory).where(ChatHistory.session_id == session_id, ChatHistory.content_type == "image").order_by(desc(ChatHistory.created_at)).limit(1)
-            result = await db_session.execute(stmt)
-            msg = result.scalar_one_or_none()
-
-            if not msg:
-                return f"未找到历史消息。"
-
-            if msg.content_type != "image":
-                # 如果不是图片，尝试用文本内容去搜图片（也是一种玩法）
-                description = msg.content
-                pic_ids = await MilvusOP.search_media([description])
-            else:
-                # 如果是图片，ChatHistory.content 存的就是描述
-                description = msg.content
-                stmt = Select(MediaStorage).where(
-                    MediaStorage.media_id == msg.media_id,
+            base_stmt = (
+                Select(ChatHistory)
+                .where(
+                    ChatHistory.session_id == session_id,
+                    ChatHistory.content_type == "image",
+                )
+                .order_by(desc(ChatHistory.created_at))
+            )
+            if normalized_msg_id:
+                stmt = (
+                    base_stmt.where(ChatHistory.content.contains(f"id: {normalized_msg_id}\n")).limit(1)
                 )
                 result = await db_session.execute(stmt)
                 msg = result.scalar_one_or_none()
-                pic_ids = await MilvusOP.search_media_by_pic([str(pic_dir / msg.file_path)])
-            if not pic_ids:
-                logger.info(f"未找到匹配的表情包: {description}")
-                return "没有搜索到相似图片"
-            # 从数据库获取每张图片的详细信息
-            images_info = []
-            for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
-                pic = (
-                    await db_session.execute(
-                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id), MediaStorage.blocked.is_(False))
+                if msg is None:
+                    stmt = (
+                        base_stmt.where(ChatHistory.content.contains(f"id:{normalized_msg_id}\n")).limit(1)
                     )
-                ).scalar()
+                    result = await db_session.execute(stmt)
+                    msg = result.scalar_one_or_none()
+            else:
+                result = await db_session.execute(base_stmt.limit(1))
+                msg = result.scalar_one_or_none()
 
-                if pic:
-                    images_info.append(
-                        {
-                            "pic_id": pic_id,
-                            "description": pic.description,
-                        }
+            if not msg:
+                return "未找到对应图片消息。"
+
+            if msg.media_id is None:
+                return "目标消息没有关联图片，无法进行相似搜索。"
+
+            media_obj = (
+                await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == msg.media_id))
+            ).scalar_one_or_none()
+            if not media_obj or not media_obj.file_path:
+                return "无法找到原图文件，无法进行分析。"
+
+            pic_ids = await DB.search_media_by_pic([str(pic_dir / media_obj.file_path)])
+            if not pic_ids:
+                logger.info(f"未找到相似图片, source_id: {msg.media_id}")
+                return "没有搜索到相似图片"
+
+            images_info = []
+            rows = (
+                await db_session.execute(
+                    Select(MediaStorage).where(
+                        MediaStorage.media_id.in_(pic_ids),
+                        MediaStorage.blocked.is_(False),
                     )
+                )
+            ).scalars().all()
+            media_map = {media.media_id: media for media in rows}
+
+            for pic_id in pic_ids:
+                if pic_id not in media_map:
+                    continue
+                pic = media_map[pic_id]
+                images_info.append(
+                    {
+                        "pic_id": str(pic_id),
+                        "description": pic.description or "未知描述",
+                    }
+                )
 
             if not images_info:
-                logger.info(f"相似图检索结果均被黑名单过滤: {description}")
+                logger.info(f"相似图检索结果均被黑名单过滤: source_id={msg.media_id}")
                 return "没有搜索到相似图片"
 
             return json.dumps(
                 {
                     "success": True,
-                    "source_description": description,  # 告诉模型原图是啥
+                    "source_media_id": msg.media_id,
                     "images": images_info,
                     "count": len(images_info),
+                    "note": "请根据 pic_id 调用 send_meme_image 发送",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -553,7 +572,7 @@ def create_search_meme_tool(db_session):
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await MilvusOP.search_media([description])
+            pic_ids = await DB.search_media([description])
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
@@ -870,9 +889,29 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return ""
 
 
+async def get_group_context(db_session, session_id: str) -> str:
+    """获取群体认知档案 Prompt"""
+    try:
+        stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+        record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+        if not record or not (record.summary or "").strip():
+            return ""
+
+        return f"""
+【群体认知档案】
+{record.summary}
+（档案更新于 {record.updated_at.strftime("%Y-%m-%d %H:%M")}）
+"""
+    except Exception as e:
+        logger.error(f"获取群体档案失败: {e}")
+        return ""
+
+
 async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    group_context = await get_group_context(db_session, session_id)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
@@ -887,6 +926,8 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
    - “不要在群里做题啊喂”
    - 或者直接发个表情包略过。
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+
+{group_context}
 
 {relation_context}
 
@@ -931,7 +972,7 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 
 【RAG 工具使用规则】
 
-RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
+RAG 搜索结果特性：搜索结果已经经过向量检索与 rerank 排序，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
 搜索目的：rag_search 主要用于：
 了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
 确保对话连贯性，回顾某个特定时间点发生过的讨论。
@@ -959,34 +1000,22 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 """
     report_tool = create_report_tool(db_session, session_id, user_id, user_name, model)
 
-    search_meme_tool = create_search_meme_tool(db_session)
-    send_meme_tool = create_send_meme_tool(db_session, session_id)
     relation_tool = create_relation_tool(db_session, user_id, user_name)
-    similar_meme_tool = create_similar_meme_tool(db_session, session_id)
-    if not user_id or not user_name:
-        tools = [
-            search_web,
+    tools = [
+        search_web,
+        create_reply_tool(db_session, session_id),
+        calculate_expression,
+        report_tool,
+    ]
+    if DB.enabled:
+        tools += [
             search_history_context,
-            create_reply_tool(db_session, session_id),
-            search_meme_tool,  # 搜索工具（带数据库会话）
-            similar_meme_tool,
-            send_meme_tool,  # 发送工具
-            calculate_expression,
-            report_tool,
+            create_search_meme_tool(db_session),
+            create_similar_meme_tool(db_session, session_id),
+            create_send_meme_tool(db_session, session_id),
         ]
-    else:
-        # 组合所有工具
-        tools = [
-            search_web,
-            search_history_context,
-            create_reply_tool(db_session, session_id),
-            search_meme_tool,  # 搜索工具（带数据库会话）
-            similar_meme_tool,
-            send_meme_tool,  # 发送工具
-            calculate_expression,
-            relation_tool,
-            report_tool,
-        ]
+    if user_id and user_name:
+        tools.append(relation_tool)
 
     middleware = None
     if ToolCallLimitMiddleware is not None:
