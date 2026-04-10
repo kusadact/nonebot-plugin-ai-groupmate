@@ -114,6 +114,8 @@ nb -py /path/to/python orm upgrade
 - `remote_media_embedding_*`：图片向量
 - `remote_media_rerank_*`：图片 rerank
 
+当前分支已经移除旧版统一 `/embed`、`/rerank`、`/clip` 接口兼容层，只保留分路配置。
+
 ### 配置表
 
 | 配置项 | 必填 | 默认值 | 说明 |
@@ -125,8 +127,6 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__qdrant_api_key` | 否 | 空 | Qdrant API Key |
 | `ai_groupmate__chat_vector_dim` | 否 | `1024` | 聊天文本向量维度 |
 | `ai_groupmate__media_vector_dim` | 否 | `2560` | 图片向量维度 |
-| `ai_groupmate__remote_model_base_url` | 否 | 空 | 旧版统一模型服务入口，兼容保留 |
-| `ai_groupmate__remote_model_api_key` | 否 | 空 | 旧版统一模型服务 API Key |
 | `ai_groupmate__remote_embedding_base_url` | 否 | 空 | 文本 embedding 服务地址，OpenAI 风格 |
 | `ai_groupmate__remote_embedding_api_key` | 否 | 空 | 文本 embedding API Key |
 | `ai_groupmate__remote_embedding_model` | 否 | 空 | 文本 embedding 模型名 |
@@ -143,8 +143,6 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__remote_media_rerank_base_url` | 否 | 空 | 图片 rerank 地址 |
 | `ai_groupmate__remote_media_rerank_api_key` | 否 | 空 | 图片 rerank API Key |
 | `ai_groupmate__remote_media_rerank_model` | 否 | 空 | 图片 rerank 模型名 |
-| `ai_groupmate__remote_clip_base_url` | 否 | 空 | 旧版 clip 接口地址，兼容保留 |
-| `ai_groupmate__remote_clip_api_key` | 否 | 空 | 旧版 clip API Key，兼容保留 |
 | `ai_groupmate__tavily_api_key` | 否 | 空 | Tavily 搜索 API Key |
 | `ai_groupmate__qwen_token` | 否 | 空 | DashScope 通用 API Key，`summary` / `multimodal` 可回退使用 |
 | `ai_groupmate__summary_model` | 否 | `qwen-flash` | 群体认知档案总结模型 |
@@ -180,6 +178,7 @@ ai_groupmate__multimodal_model=qwen-vl-max
 - 主对话模型走 `openai_*`
 - `summary_model` 和 `multimodal_model` 默认可直接回退使用 `qwen_token`
 - 此配置下若不填 `qdrant_uri`，RAG 和表情包向量功能会被禁用，但普通群聊仍可运行
+- 如果后续启用 Qdrant，需补齐独立的文本 / 图片向量服务配置，不再支持旧版统一接口兜底
 
 ### 当前 fork 推荐配置
 
@@ -271,6 +270,7 @@ ai_groupmate__remote_media_rerank_model=
 
 - 当前主线已经切到 **Qdrant**
 - `vlm.py` 已移除，图片理解走 `multimodal_model`
+- 旧版 `remote_model_*` / `remote_clip_*` 兼容配置已经移除，需要改成 `remote_embedding_*`、`remote_rerank_*`、`remote_media_embedding_*`、`remote_media_rerank_*`
 - 聊天向量与图片向量默认维度为 **1024 / 2560**
 - 如果旧向量库维度不一致，必须重建 `chat_collection` 和 `media_collection`
 - 迁移后请执行 ORM 迁移，确保以下结构已经到位：
