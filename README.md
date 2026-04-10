@@ -20,7 +20,7 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
   - OpenAI 风格 `/v1/embeddings`
   - 阿里百炼原生多模态 embedding 接口 `qwen3-vl-embedding`
 - 图片向量化与图片 rerank 使用 OpenAI 风格接口，插件侧会请求 `base_url + /embeddings` 与 `base_url + /rerank`，图片以 base64 data URL 传输。
-- 文本与图片向量库默认维度调整为 `2048`；升级后需要重建现有 Milvus `chat_collection` / `media_collection`。
+- 文本与图片向量库默认维度调整为 `1024 / 2560`；升级后需要重建现有 Milvus `chat_collection` / `media_collection`。
 - 新增 superuser 手动开关指令：`/ai on|off|status`
   - `off` 仅停止 AI 回复与向量库查询/写入；VLM 识别与聊天记录入库不受影响。
   - `status` 会实际请求 Milvus，并区分 `down (tunnel:...)` 与 `down (milvus:...)`。
@@ -54,14 +54,14 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__milvus_db_name | 否 | ai_groupmate | Milvus 数据库名（远程 Milvus/Zilliz 生效；Lite `.db` 模式忽略） |
 | ai_groupmate__milvus_user | 否 | 无| milvus 用户名 |
 | ai_groupmate__milvus_password | 否 | 无 | milvus 密码 |
-| ai_groupmate__chat_vector_dim | 否 | 2048 | 聊天文本向量维度 |
-| ai_groupmate__media_vector_dim | 否 | 2048 | 图片向量维度 |
+| ai_groupmate__chat_vector_dim | 否 | 1024 | 聊天文本向量维度 |
+| ai_groupmate__media_vector_dim | 否 | 2560 | 图片向量维度 |
 | ai_groupmate__remote_model_base_url | 否 | 无 | 旧版统一模型服务地址（`/embed` / `/rerank`） |
 | ai_groupmate__remote_model_api_key | 否 | 无 | 远程模型服务 API Key |
 | ai_groupmate__remote_embedding_base_url | 否 | 无 | embedding 分路地址（硅基流动/OpenAI 风格） |
 | ai_groupmate__remote_embedding_api_key | 否 | 无 | embedding 分路 API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_embedding_model | 否 | 无 | embedding 模型名（如 `BAAI/bge-m3`） |
-| ai_groupmate__remote_embedding_dimensions | 否 | 2048 | 文本 embedding 维度 |
+| ai_groupmate__remote_embedding_dimensions | 否 | 1024 | 文本 embedding 维度 |
 | ai_groupmate__remote_rerank_base_url | 否 | 无 | rerank 分路地址（硅基流动） |
 | ai_groupmate__remote_rerank_api_key | 否 | 无 | rerank 分路 API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_rerank_model | 否 | 无 | rerank 模型名（如 `BAAI/bge-reranker-v2-m3`） |
@@ -69,7 +69,7 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__remote_media_embedding_base_url | 否 | 无 | 图片 embedding 地址；`openai` 时填 `/v1` 前缀，`aliyun_dashscope` 时填百炼原生多模态 embedding 完整 URL |
 | ai_groupmate__remote_media_embedding_api_key | 否 | 无 | 图片 embedding API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_media_embedding_model | 否 | 无 | 图片 embedding 模型名 |
-| ai_groupmate__remote_media_embedding_dimensions | 否 | 2048 | 图片 embedding 维度 |
+| ai_groupmate__remote_media_embedding_dimensions | 否 | 2560 | 图片 embedding 维度 |
 | ai_groupmate__remote_media_rerank_base_url | 否 | 无 | 图片 rerank 分路地址（建议直接填带 `/v1` 的 base_url） |
 | ai_groupmate__remote_media_rerank_api_key | 否 | 无 | 图片 rerank API Key（为空则回退用 remote_model_api_key） |
 | ai_groupmate__remote_media_rerank_model | 否 | 无 | 图片 rerank 模型名 |
@@ -100,13 +100,13 @@ ai_groupmate__milvus_db_name=ai_groupmate
 ```env
 ai_groupmate__milvus_uri=http://127.0.0.1:19530
 ai_groupmate__milvus_db_name=ai_groupmate
-ai_groupmate__chat_vector_dim=2048
-ai_groupmate__media_vector_dim=2048
+ai_groupmate__chat_vector_dim=1024
+ai_groupmate__media_vector_dim=2560
 
 ai_groupmate__remote_embedding_base_url=https://api.siliconflow.cn/v1
 ai_groupmate__remote_embedding_api_key=sk-xxxx
 ai_groupmate__remote_embedding_model=Qwen/Qwen3-Embedding-4B
-ai_groupmate__remote_embedding_dimensions=2048
+ai_groupmate__remote_embedding_dimensions=1024
 
 ai_groupmate__remote_rerank_base_url=https://api.siliconflow.cn/v1
 ai_groupmate__remote_rerank_api_key=sk-xxxx
@@ -116,7 +116,7 @@ ai_groupmate__remote_media_embedding_provider=aliyun_dashscope
 ai_groupmate__remote_media_embedding_base_url=https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding
 ai_groupmate__remote_media_embedding_api_key=sk-xxxx
 ai_groupmate__remote_media_embedding_model=qwen3-vl-embedding
-ai_groupmate__remote_media_embedding_dimensions=2048
+ai_groupmate__remote_media_embedding_dimensions=2560
 
 ai_groupmate__remote_media_rerank_base_url=
 ai_groupmate__remote_media_rerank_api_key=

@@ -32,10 +32,10 @@ try:
 except Exception:
     ToolCallLimitMiddleware = None
 
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
+from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
 from ..favorability import apply_monika_favorability_change
-from ..milvus import MilvusOP
+from ..memory import DB
 
 require("nonebot_plugin_localstore")
 
@@ -155,19 +155,11 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
 
-        # Fast probe to avoid hanging the agent when Milvus (or the tunnel) is unavailable.
-        try:
-            client = MilvusOP._get_async_client()
-            try:
-                await asyncio.wait_for(client.list_collections(), timeout=2.0)
-            except AttributeError:
-                await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-        except Exception as e:
-            logger.error(f"RAG skipped (Milvus unavailable): {e}")
-            return '未找到相关历史记录'
+        if not DB.enabled:
+            return "未找到相关历史记录"
 
         search_res = await asyncio.wait_for(
-            MilvusOP.search(
+            DB.search(
                 [query],
                 search_filter=f'session_id == "{runtime.context.session_id}"',
                 with_meta=True,
@@ -437,7 +429,7 @@ def create_similar_meme_tool(db_session, session_id: str):
             if msg.content_type != "image":
                 # 如果不是图片，尝试用文本内容去搜图片（也是一种玩法）
                 description = msg.content
-                pic_ids = await MilvusOP.search_media([description])
+                pic_ids = await DB.search_media([description])
             else:
                 # 如果是图片，ChatHistory.content 存的就是描述
                 description = msg.content
@@ -446,7 +438,7 @@ def create_similar_meme_tool(db_session, session_id: str):
                 )
                 result = await db_session.execute(stmt)
                 msg = result.scalar_one_or_none()
-                pic_ids = await MilvusOP.search_media_by_pic([str(pic_dir / msg.file_path)])
+                pic_ids = await DB.search_media_by_pic([str(pic_dir / msg.file_path)])
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
                 return "没有搜索到相似图片"
@@ -553,7 +545,7 @@ def create_search_meme_tool(db_session):
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await MilvusOP.search_media([description])
+            pic_ids = await DB.search_media([description])
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
@@ -870,9 +862,29 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return ""
 
 
+async def get_group_context(db_session, session_id: str) -> str:
+    """获取群体认知档案 Prompt"""
+    try:
+        stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+        record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+        if not record or not (record.summary or "").strip():
+            return ""
+
+        return f"""
+【群体认知档案】
+{record.summary}
+（档案更新于 {record.updated_at.strftime("%Y-%m-%d %H:%M")}）
+"""
+    except Exception as e:
+        logger.error(f"获取群体档案失败: {e}")
+        return ""
+
+
 async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    group_context = await get_group_context(db_session, session_id)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
@@ -887,6 +899,8 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
    - “不要在群里做题啊喂”
    - 或者直接发个表情包略过。
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+
+{group_context}
 
 {relation_context}
 
@@ -931,7 +945,7 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 
 【RAG 工具使用规则】
 
-RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
+RAG 搜索结果特性：搜索结果已经经过向量检索与 rerank 排序，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
 搜索目的：rag_search 主要用于：
 了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
 确保对话连贯性，回顾某个特定时间点发生过的讨论。

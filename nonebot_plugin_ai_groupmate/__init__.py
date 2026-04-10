@@ -4,6 +4,8 @@ import datetime
 import traceback
 import json
 import re
+import base64
+import mimetypes
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -11,11 +13,14 @@ from typing import Any
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config, get_driver
 from nonebot.permission import SUPERUSER
+from pydantic import SecretStr
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
 from nonebot.adapters import Bot, Event, Message
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage as LCHumanMessage, SystemMessage as LCSystemMessage
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
@@ -23,7 +28,7 @@ require("nonebot_plugin_uninfo")
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
-from sqlalchemy import Select, desc
+from sqlalchemy import Select, desc, func as sqlfunc
 from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
@@ -31,16 +36,15 @@ from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_i
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
-from .vlm import image_vl
 from .agent import check_if_should_reply, choice_response_strategy
-from .model import ChatHistory, MediaStorage, ChatHistorySchema
+from .model import ChatHistory, MediaStorage, ChatHistorySchema, GroupMemory
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
 from .config import Config
-from .milvus import MilvusOP
+from .memory import DB
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -58,6 +62,205 @@ pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
+
+_DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def _pick_api_key(*values: str) -> str:
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+_summary_api_key = _pick_api_key(plugin_config.summary_api_key, plugin_config.qwen_token, plugin_config.openai_token)
+summary_model = (
+    ChatOpenAI(
+        model=plugin_config.summary_model,
+        api_key=SecretStr(_summary_api_key),
+        base_url=plugin_config.summary_base_url or _DEFAULT_DASHSCOPE_BASE_URL,
+        temperature=0.3,
+        max_completion_tokens=800,
+    )
+    if plugin_config.summary_model and _summary_api_key
+    else None
+)
+
+_multimodal_api_key = _pick_api_key(plugin_config.multimodal_api_key, plugin_config.qwen_token)
+multimodal_model = (
+    ChatOpenAI(
+        model=plugin_config.multimodal_model,
+        api_key=SecretStr(_multimodal_api_key),
+        base_url=plugin_config.multimodal_base_url or _DEFAULT_DASHSCOPE_BASE_URL,
+        temperature=0.01,
+    )
+    if plugin_config.multimodal_model and _multimodal_api_key
+    else None
+)
+
+
+def _extract_model_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = _strip_code_fence(text)
+    if not cleaned:
+        return None
+
+    try:
+        payload = json.loads(cleaned)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or start >= end:
+        return None
+
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _image_to_data_uri(file_path: Path) -> str:
+    mime_type = mimetypes.guess_type(str(file_path))[0] or "image/png"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+    payload = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{payload}"
+
+
+async def _call_multimodal_model(prompt: str, file_path: Path, timeout_s: float = 90.0) -> str | None:
+    if multimodal_model is None:
+        return None
+
+    try:
+        response = await asyncio.wait_for(
+            multimodal_model.ainvoke(
+                [
+                    LCSystemMessage(content="你是一个图片分析助手，请严格按照要求输出结果。"),
+                    LCHumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": _image_to_data_uri(file_path)}},
+                        ]
+                    ),
+                ]
+            ),
+            timeout=timeout_s,
+        )
+        text = _extract_model_text(response.content)
+        return text or None
+    except asyncio.TimeoutError:
+        logger.warning(f"多模态模型调用超时: {file_path}")
+        return None
+    except Exception as e:
+        logger.error(f"多模态模型调用失败 {file_path}: {e}")
+        return None
+
+
+async def _describe_image_short(file_path: Path) -> str:
+    prompt = (
+        "请用一句中文简短描述这张图片，保留主体和情绪信息，"
+        "不要编造细节，不要超过30个字，只输出描述本身。"
+    )
+    result = await _call_multimodal_model(prompt, file_path, timeout_s=60.0)
+    if not result:
+        return "[图片]"
+    result = _strip_code_fence(result).replace("\n", " ").strip()
+    if not result:
+        return "[图片]"
+    return result[:60]
+
+
+async def _analyze_meme_image(file_path: Path) -> tuple[bool | None, str]:
+    prompt = """
+你是一个专业的表情包分析员。请分析这张图片，并严格输出 JSON。
+
+判断规则：
+1. 如果是带梗、表情、配字吐槽、二创、熊猫头、二次元 reaction image，is_meme=true。
+2. 如果只是普通照片、聊天截图、风景、证件照、商品图、长篇文档截图，is_meme=false。
+3. description 需要概括主体、文字内容和表达情绪，方便后续搜索。
+
+只输出下面格式，不要输出其他内容：
+{
+  "is_meme": true,
+  "description": "熊猫头流泪，配文我太难了，表达委屈和无奈"
+}
+"""
+    result = await _call_multimodal_model(prompt, file_path, timeout_s=90.0)
+    payload = _extract_json_object(result or "")
+    if payload is None:
+        logger.warning(f"多模态模型未返回合法 JSON: {file_path}")
+        return None, ""
+
+    is_meme = payload.get("is_meme")
+    description = str(payload.get("description", "") or "").strip()
+    if not isinstance(is_meme, bool):
+        return None, description
+    return is_meme, description
+
+
+async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
+    if summary_model is None:
+        return None
+
+    system_prompt = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
+档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
+规则：
+1. 只能基于提供的聊天记录总结，不要凭空发明内容
+2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
+3. 如果某个内容长期没有聊天印证，可删除
+4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容"""
+    history_intro = "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
+    user_prompt = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{chat_text}\n\n请输出更新后的档案："
+
+    try:
+        response = await asyncio.wait_for(
+            summary_model.ainvoke(
+                [
+                    LCSystemMessage(content=system_prompt),
+                    LCHumanMessage(content=user_prompt),
+                ]
+            ),
+            timeout=120.0,
+        )
+        text = _extract_model_text(response.content)
+        return text or None
+    except asyncio.TimeoutError:
+        logger.warning("群体认知档案更新超时，跳过本轮")
+        return None
+    except Exception as e:
+        logger.error(f"群体认知档案更新失败: {e}")
+        return None
 
 switch_file = plugin_data_dir / "switch.json"
 _enabled = True
@@ -343,6 +546,11 @@ async def _try_auto_block_replied_meme(
                 f"err={type(e).__name__}: {e}"
             )
             return False
+        if DB.enabled:
+            try:
+                await DB.delete_media(media_id_int)
+            except Exception as e:
+                logger.warning(f"[MemeBlock] 从 Qdrant 删除拉黑表情包失败 media_id={media_id_int}: {e}")
     logger.info(
         f"[MemeBlock] superuser={sender_user_id} session_id={session_id} "
         f"reply_to={reply_message_id} media_id={media_id_int} changed={changed}"
@@ -374,67 +582,13 @@ async def _(arg: Message = CommandArg()):
         await ai.finish("ai disabled")
     elif sub in {"status", "state", "s", "", "状态"}:
         status = "on" if _is_enabled() else "off"
-        milvus_uri = (plugin_config.milvus_uri or "").strip()
-        milvus_line = "n/a"
+        if not DB.enabled:
+            qdrant_line = "disabled"
+        else:
+            ok, detail = await DB.healthcheck()
+            qdrant_line = detail if ok else f"down ({detail})"
 
-        if milvus_uri:
-            is_remote = ("://" in milvus_uri) or (milvus_uri.count(":") == 1 and milvus_uri.rsplit(":", 1)[1].isdigit())
-            if not is_remote:
-                # Milvus Lite / local file path
-                p = Path(milvus_uri)
-                milvus_line = "ok" if p.exists() else "down (local)"
-            else:
-                # TCP probe first: distinguish "tunnel down" vs "Milvus down" behind the tunnel.
-                host = None
-                port = None
-                try:
-                    if "://" in milvus_uri:
-                        from urllib.parse import urlparse
-
-                        u = urlparse(milvus_uri)
-                        host = u.hostname
-                        port = u.port or 19530
-                    else:
-                        host, port_s = milvus_uri.rsplit(":", 1)
-                        port = int(port_s)
-                except Exception:
-                    host = None
-                    port = None
-
-                tunnel_ok: bool | None = None
-                tunnel_err = ""
-                if host and port:
-                    try:
-                        r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=0.8)
-                        w.close()
-                        try:
-                            await w.wait_closed()
-                        except Exception:
-                            pass
-                        tunnel_ok = True
-                    except asyncio.TimeoutError:
-                        tunnel_ok = False
-                        tunnel_err = "timeout"
-                    except Exception as e:
-                        tunnel_ok = False
-                        tunnel_err = type(e).__name__
-
-                if tunnel_ok is False:
-                    milvus_line = f"down (tunnel:{tunnel_err})" if tunnel_err else "down (tunnel)"
-                else:
-                    try:
-                        client = MilvusOP._get_async_client()
-                        try:
-                            await asyncio.wait_for(client.list_collections(), timeout=2.0)
-                        except AttributeError:
-                            await asyncio.wait_for(client.has_collection(collection_name="chat_collection"), timeout=2.0)
-                        milvus_line = "ok"
-                    except asyncio.TimeoutError:
-                        milvus_line = "down (milvus:timeout)"
-                    except Exception as e:
-                        milvus_line = f"down (milvus:{type(e).__name__})"
-
-        await ai.finish(f"ai status: {status}\nmilvus: {milvus_line}")
+        await ai.finish(f"ai status: {status}\nqdrant: {qdrant_line}")
     else:
         await ai.finish("Usage: /ai on|off|status")
 
@@ -601,78 +755,71 @@ async def process_image_message(
     content_type = "image"
     if not img.id:
         return
-    image_format = img.id.split(".")[-1]
 
-    # 获取和压缩图片
-    pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
-    pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
-    file_hash = generate_file_hash(pic)
-    file_path = pic_dir / f"{file_hash}.{image_format}"
+    image_format = img.id.split(".")[-1] if "." in img.id else "jpg"
+    if not image_format:
+        image_format = "jpg"
 
-    # 保存文件
-    if not file_path.exists():
-        file_path.write_bytes(pic)
     try:
-        # 查询或创建媒体记录
-        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
+        pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.warning("下载图片超时，跳过")
+        return
 
-        if existing_media:
-            # 已存在，直接使用描述
-            image_description = existing_media.description
-            existing_media.references += 1
-            db_session.add(existing_media)
+    try:
+        pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
+        file_hash = generate_file_hash(pic)
+        file_name = f"{file_hash}.{image_format}"
+        file_path = pic_dir / file_name
+
+        if not file_path.exists():
+            file_path.write_bytes(pic)
+
+        stmt = Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
+        media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+        if media_obj:
+            media_obj.references += 1
+            db_session.add(media_obj)
         else:
-            # 新图片，调用VLM获取描述
-            image_description = await image_vl(
-                file_path,
-                VLM_SHORT_PROMPT,
-                VLM_SHORT_MAX_TOKENS,
-                VLM_SHORT_TIMEOUT,
-            )
+            try:
+                async with db_session.begin_nested():
+                    media_obj = MediaStorage(
+                        file_hash=file_hash,
+                        file_path=file_name,
+                        references=1,
+                        description="[图片]",
+                    )
+                    db_session.add(media_obj)
+                    await db_session.flush()
+            except IntegrityError:
+                media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+                if media_obj is None:
+                    raise
+                media_obj.references += 1
+                db_session.add(media_obj)
 
-            if image_description:
-                media_storage = MediaStorage(
-                    file_hash=file_hash,
-                    file_path=f"{file_hash}.{image_format}",
-                    references=1,
-                    description=image_description,
-                )
-                db_session.add(media_storage)
-                await db_session.flush()  # 确保获取media_id
-                existing_media = media_storage
+        await db_session.flush()
+
+        image_description = "[图片]"
+        if media_obj:
+            cached_description = (media_obj.description or "").strip()
+            if cached_description and cached_description != "[图片]":
+                image_description = cached_description
             else:
-                file_path.unlink()
+                image_description = await _describe_image_short(file_path)
+                media_obj.description = image_description
+                db_session.add(media_obj)
 
-        # 添加聊天历史记录
-        if existing_media and image_description:
             chat_history = ChatHistory(
                 session_id=session.scene.id,
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + image_description,
                 user_name=user_name or "",
-                media_id=existing_media.media_id,
+                media_id=media_obj.media_id,
             )
             db_session.add(chat_history)
 
-        await db_session.commit()
-
-    except IntegrityError:
-        # 处理并发插入冲突
-        await db_session.rollback()
-        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
-
-        if existing_media:
-            existing_media.references += 1
-            chat_history = ChatHistory(
-                session_id=session.scene.id,
-                user_id=session.user.id,
-                content_type=content_type,
-                content=content + existing_media.description,
-                user_name=user_name or "",
-                media_id=existing_media.media_id,
-            )
-            db_session.add(chat_history)
         await db_session.commit()
 
     except Exception as e:
@@ -839,7 +986,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
 
 @scheduler.scheduled_job("interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat")
 async def vectorize_message_history():
-    if not _is_enabled():
+    if not _is_enabled() or not DB.enabled:
         return
     async with get_session() as db_session:
         session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
@@ -860,72 +1007,79 @@ async def vectorize_message_history():
 
 @scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media")
 async def vectorize_media():
-    if not _is_enabled():
+    if not _is_enabled() or not DB.enabled:
         return
-    async with get_session() as db_session:
-        medias_res = await db_session.execute(Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)))
-        medias = medias_res.scalars().all()
-        logger.info(f"待向量化媒体数量: {len(medias)}")
+    if multimodal_model is None:
+        logger.warning("未配置 multimodal_model，跳过媒体向量化")
+        return
 
-        for media in medias:
+    async with get_session() as db_session:
+        medias_res = await db_session.execute(
+            Select(MediaStorage).where(
+                MediaStorage.references >= 3,
+                MediaStorage.vectorized.is_(False),
+                MediaStorage.blocked.is_(False),
+            )
+        )
+        media_ids = [media.media_id for media in medias_res.scalars().all()]
+        logger.info(f"待向量化媒体数量: {len(media_ids)}")
+
+        for media_id in media_ids:
+            media = await db_session.get(MediaStorage, media_id)
+            if media is None:
+                continue
             try:
                 file_path = pic_dir / media.file_path
                 if not file_path.exists():
                     logger.warning(f"文件不存在: {file_path}")
                     media.vectorized = True
                     db_session.add(media)
+                    await db_session.commit()
                     continue
 
-                # 判断是否适合作为表情包
-                vlm_res = await image_vl(
-                    file_path,
-                    "请判断这张图适不适合作为表情包，只回答是或否",
-                    VLM_SHORT_MAX_TOKENS,
-                    VLM_SHORT_TIMEOUT,
-                )
-                if not vlm_res or vlm_res != "是":
+                is_meme, description = await _analyze_meme_image(file_path)
+                if is_meme is None:
+                    logger.warning(f"图片分析失败，保留待重试状态 media_id={media.media_id}")
+                    continue
+
+                if not is_meme:
                     media.vectorized = True
                     db_session.add(media)
+                    await db_session.commit()
+                    logger.info(f"图片 {media.media_id} 被判定为非表情包，跳过向量化")
                     continue
 
-                # If suitable, refresh a long description for better media search/rerank
-                long_desc = await image_vl(
-                    file_path,
-                    VLM_LONG_PROMPT,
-                    VLM_LONG_MAX_TOKENS,
-                    VLM_LONG_TIMEOUT,
+                if description:
+                    media.description = description
+
+                await DB.insert_media(
+                    media.media_id,
+                    [str(file_path)],
+                    description=media.description or description or "[图片]",
+                    file_path=str(file_path),
+                    blocked=bool(media.blocked),
                 )
-                if long_desc:
-                    media.description = long_desc
-                    db_session.add(media)
-
-                try:
-                    await MilvusOP.insert_media(
-                        media.media_id,
-                        [str(file_path)],
-                        description=media.description or "",
-                        file_path=str(file_path),
-                    )
-                    media.vectorized = True
-                    db_session.add(media)
-                    logger.info("向量化成功")
-                except Exception as e:
-                    logger.error(f"向量化插入失败 {media.media_id}: {e}")
-                    # don't mark as vectorized so it can retry later
-                    continue
-
+                media.vectorized = True
+                db_session.add(media)
+                await db_session.commit()
+                logger.info(f"媒体向量化成功 media_id={media.media_id}")
             except Exception as e:
                 logger.error(f"处理媒体 {getattr(media, 'media_id', 'unknown')} 失败: {e}")
+                await db_session.rollback()
                 continue
 
-        await db_session.commit()
         logger.info("向量化媒体完成")
 
 
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with get_session() as db_session:
-        result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=15)))
+        result = await db_session.execute(
+            Select(MediaStorage).where(
+                MediaStorage.references < 3,
+                MediaStorage.created_at < datetime.datetime.now() - datetime.timedelta(days=15),
+            )
+        )
         medias = result.scalars().all()
 
         if not medias:
@@ -946,16 +1100,99 @@ async def clear_cache_pic():
 
         for media in records_to_delete:
             try:
+                if DB.enabled:
+                    try:
+                        await DB.delete_media(int(media.media_id))
+                    except Exception as e:
+                        logger.warning(f"删除 Qdrant 媒体向量失败 media_id={media.media_id}: {e}")
                 await db_session.delete(media)
             except Exception as e:
                 logger.error(f"删除数据库记录失败 {getattr(media, 'media_id', 'unknown')}: {e}")
 
         await db_session.commit()
         logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
-# VLM short/long description tuning
-VLM_SHORT_PROMPT = "请用一句话简短描述这张图，不超过30字"
-VLM_SHORT_MAX_TOKENS = 128
-VLM_SHORT_TIMEOUT = 60.0
-VLM_LONG_PROMPT = "请描述一下这个图片"
-VLM_LONG_MAX_TOKENS = 1024
-VLM_LONG_TIMEOUT = 180.0
+
+
+async def _update_single_group_memory(db_session: async_scoped_session, session_id: str) -> None:
+    stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+    record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    total_count = (
+        await db_session.execute(
+            Select(sqlfunc.count(ChatHistory.msg_id)).where(ChatHistory.session_id == session_id)
+        )
+    ).scalar_one()
+    last_count = record.msg_count_at_last_update if record else 0
+    new_msg_count = total_count - last_count
+
+    if record and new_msg_count < 100:
+        time_since = datetime.datetime.now() - record.updated_at
+        if time_since.total_seconds() < 6 * 3600:
+            logger.info(f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条）")
+            return
+
+    cutoff = record.updated_at if record else datetime.datetime.min
+    recent_msgs = (
+        await db_session.execute(
+            Select(ChatHistory)
+            .where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.created_at > cutoff,
+                ChatHistory.content_type.in_(["text", "bot", "image"]),
+            )
+            .order_by(ChatHistory.created_at)
+            .limit(200)
+        )
+    ).scalars().all()
+    if not recent_msgs:
+        return
+
+    chat_text = "\n".join(
+        f"[{msg.created_at.strftime('%m-%d %H:%M')}] {msg.user_name}: {msg.content[:120]}"
+        for msg in recent_msgs
+    )
+
+    existing_summary = record.summary if record else ""
+    new_summary = await _call_summary_model(existing_summary, chat_text)
+    if not new_summary:
+        return
+
+    if not record:
+        record = GroupMemory(
+            session_id=session_id,
+            summary=new_summary,
+            msg_count_at_last_update=total_count,
+        )
+        db_session.add(record)
+    else:
+        record.summary = new_summary
+        record.msg_count_at_last_update = total_count
+
+    await db_session.commit()
+    logger.info(f"群体认知档案更新成功 session_id={session_id}")
+
+
+@scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory")
+async def update_group_memory():
+    if not _is_enabled() or summary_model is None:
+        return
+
+    async with get_session() as db_session:
+        time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
+        stmt = Select(ChatHistory.session_id.distinct()).where(ChatHistory.created_at > time_threshold)
+        session_ids = (await db_session.execute(stmt)).scalars().all()
+
+    if not session_ids:
+        return
+
+    sem = asyncio.Semaphore(5)
+
+    async def _update_one(session_id: str) -> None:
+        async with sem:
+            async with get_session() as db_session:
+                try:
+                    await _update_single_group_memory(db_session, session_id)
+                except Exception as e:
+                    logger.error(f"更新群体认知档案失败 session_id={session_id}: {e}")
+
+    await asyncio.gather(*[_update_one(session_id) for session_id in session_ids])
