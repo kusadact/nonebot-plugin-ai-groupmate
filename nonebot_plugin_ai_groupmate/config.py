@@ -7,10 +7,6 @@ class ScopedConfig(BaseModel):
     personality_setting: str = ""
     qdrant_uri: str = ""
     qdrant_api_key: str = ""
-    milvus_uri: str = "milvus_demo.db"
-    milvus_db_name: str = "ai_groupmate"
-    milvus_user: str = ""
-    milvus_password: str = ""
     chat_vector_dim: int = 1024
     media_vector_dim: int = 2560
     # 兼容旧版：远程模型统一入口（/embed /rerank /clip）
@@ -51,11 +47,6 @@ class ScopedConfig(BaseModel):
     openai_base_url: str = ""
     openai_model: str = ""
     openai_token: str = ""
-    vlm_ollama_base_url: str = ""
-    vlm_model: str = ""
-    vlm_provider: str = "ollama"  # 可选: "ollama", "openai"
-    vlm_openai_base_url: str = ""
-    vlm_openai_api_key: str = ""
 
 
 class Config(BaseModel):
