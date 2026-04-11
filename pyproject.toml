@@ -1,0 +1,73 @@
+[project]
+name = "nonebot-plugin-ai-groupmate"
+version = "2.0.1.post1"
+description = "AI 群友 NoneBot 插件 fork"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "kusadact", email = "959472968@qq.com" },
+]
+dependencies = [
+    "jieba>=0.42.1",
+    "langchain>=1.1.0",
+    "langchain-core>=1.1.0",
+    "langchain-openai>=1.0.3",
+    "langchain-tavily>=0.2.13",
+    "nonebot-plugin-alconna>=0.60.3",
+    "nonebot-plugin-apscheduler>=0.5.0",
+    "nonebot-plugin-localstore>=0.7.4",
+    "nonebot-plugin-orm>=0.8.2",
+    "nonebot-plugin-uninfo>=0.10.0",
+    "nonebot2>=2.4.4,<3.0.0",
+    "pillow>=11.1.0",
+    "pydantic>=2.7.0,<3.0.0",
+    "qdrant-client>=1.17.0",
+    "simpleeval>=1.0.3",
+    "sqlalchemy>=2.0.0",
+    "tiktoken>=0.9.0",
+    "tqdm>=4.67.1",
+    "wordcloud>=1.9.4",
+]
+
+[dependency-groups]
+dev = [
+    "nb-cli>=1.5.0",
+    "nonebot-adapter-onebot>=2.4.6,<3.0.0",
+    "nonebot-plugin-orm[default]>=0.8.2",
+    "nonebot2[fastapi]>=2.4.4,<3.0.0",
+    "ruff>=0.14.5,<1.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = ">=0.11.0"
+default-groups = ["dev"]
+
+[tool.uv.build-backend]
+module-name = "nonebot_plugin_ai_groupmate"
+module-root = ""
+source-include = ["scripts/**", "mem0_api/**"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "UP", "I"]
+ignore = ["E402"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["nonebot_plugin_ai_groupmate"]
+
+[tool.nonebot]
+adapters = []
+plugins = ["nonebot_plugin_ai_groupmate"]
+
+[project.urls]
+Homepage = "https://github.com/kusadact/nonebot-plugin-ai-groupmate"
+Repository = "https://github.com/kusadact/nonebot-plugin-ai-groupmate"
+Upstream = "https://github.com/yaowan233/nonebot-plugin-ai-groupmate"
