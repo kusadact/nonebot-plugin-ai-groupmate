@@ -12,3 +12,4 @@ scripts/rebuild_vectors.config
 # local ops folders
 server/
 scripts/
+updates/
