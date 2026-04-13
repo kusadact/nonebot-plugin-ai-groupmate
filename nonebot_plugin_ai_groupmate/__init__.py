@@ -944,7 +944,17 @@ async def handle_reply_logic(
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
         try:
-            await asyncio.wait_for(choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, ""),timeout=120.0)
+            await asyncio.wait_for(
+                choice_response_strategy(
+                    db_session,
+                    session.scene.id,
+                    last_msg,
+                    user_id,
+                    user_name,
+                    plugin_config.personality_setting,
+                ),
+                timeout=120.0,
+            )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时，跳过回复 - session: {session.scene.id}")
             return
