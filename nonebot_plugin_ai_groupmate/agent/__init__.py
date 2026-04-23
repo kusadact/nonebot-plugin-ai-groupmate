@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import jieba
 from langchain_core.prompts import ChatPromptTemplate
-from nonebot import require, get_plugin_config
+from nonebot import require, get_bot, get_plugin_config
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select, func, extract, desc
@@ -889,6 +889,126 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
+def create_mute_tool(
+    session_id: str,
+    request_id: str | None,
+    interface: QryItrface | None,
+    bot_id: str | None,
+    current_user_id: str | None,
+    current_user_name: str | None,
+):
+    """创建禁言工具。仅在 bot 有管理权限时注入。"""
+
+    def _extract_numeric_id(raw: str | None) -> int | None:
+        text = str(raw or "").strip()
+        match = re.search(r"(\d+)$", text)
+        return int(match.group(1)) if match else None
+
+    def _member_aliases(member: Any) -> set[str]:
+        aliases = {
+            str(getattr(member, "id", "") or "").strip(),
+            str(getattr(member, "name", "") or "").strip(),
+            str(getattr(member, "nick", "") or "").strip(),
+            str(getattr(getattr(member, "user", None), "name", "") or "").strip(),
+            str(getattr(getattr(member, "user", None), "nick", "") or "").strip(),
+        }
+        return {alias for alias in aliases if alias}
+
+    @tool("mute_user")
+    async def mute_user(target_user_name: str, duration_seconds: int, reason: str) -> str:
+        """
+        禁言指定用户。仅在 bot 是管理员或群主时可用。
+
+        参数:
+        - target_user_name: 要禁言的用户昵称；用户请求“禁言我”时可传“我”或“自己”
+        - duration_seconds: 禁言时长（秒），0 表示解除禁言，最大 2592000
+        - reason: 操作原因
+        """
+        if request_id is not None and not await is_request_active(session_id, request_id):
+            return "请求已过期，已取消操作。"
+        if interface is None:
+            return "无法获取群成员接口，禁言失败。"
+        if not bot_id:
+            return "无法获取 bot ID，禁言失败。"
+        if not reason or not reason.strip():
+            return "禁言原因不能为空。"
+        if duration_seconds < 0 or duration_seconds > 2592000:
+            return "禁言时长必须在 0 到 2592000 秒之间。"
+
+        try:
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            bot_member = None
+            target_member = None
+            normalized_target = str(target_user_name or "").strip().lstrip("@")
+
+            for member in members:
+                if str(member.id) == str(bot_id):
+                    bot_member = member
+
+                if normalized_target in {"我", "我自己", "自己", "me", "self"}:
+                    if current_user_id and str(member.id) == str(current_user_id):
+                        target_member = member
+                else:
+                    aliases = _member_aliases(member)
+                    if normalized_target and normalized_target in aliases:
+                        target_member = member
+
+            if bot_member is None:
+                return "无法获取 bot 的群成员信息。"
+
+            bot_role = getattr(getattr(bot_member, "role", None), "name", None)
+            if bot_role not in {"owner", "admin"}:
+                return "bot 不是管理员或群主，无法执行禁言。"
+
+            if target_member is None and current_user_name and normalized_target == current_user_name:
+                for member in members:
+                    if current_user_id and str(member.id) == str(current_user_id):
+                        target_member = member
+                        break
+
+            if target_member is None:
+                return f"未找到用户“{target_user_name}”，请确认昵称是否正确。"
+
+            target_role = getattr(getattr(target_member, "role", None), "name", None)
+            if target_role in {"owner", "admin"}:
+                return f"无法禁言管理员或群主“{target_user_name}”。"
+
+            group_num = _extract_numeric_id(session_id)
+            user_num = _extract_numeric_id(str(target_member.id))
+            if group_num is None or user_num is None:
+                return "当前适配器会话 ID 格式不支持禁言。"
+
+            bot = get_bot(bot_id)
+            if hasattr(bot, "set_group_ban"):
+                await bot.set_group_ban(
+                    group_id=group_num,
+                    user_id=user_num,
+                    duration=duration_seconds,
+                )
+            elif hasattr(bot, "call_api"):
+                await bot.call_api(
+                    "set_group_ban",
+                    group_id=group_num,
+                    user_id=user_num,
+                    duration=duration_seconds,
+                )
+            else:
+                return "当前适配器不支持禁言功能。"
+
+            action = "解除禁言" if duration_seconds == 0 else f"禁言 {duration_seconds} 秒"
+            display_name = current_user_name if normalized_target in {"我", "我自己", "自己", "me", "self"} else target_user_name
+            logger.info(
+                f"已{action}用户 name={display_name!r} user_id={target_member.id} session_id={session_id} reason={reason}"
+            )
+            return f"已成功{action}用户“{display_name}”。原因：{reason}"
+        except Exception as e:
+            logger.error(f"禁言工具执行失败: {e}")
+            print(traceback.format_exc())
+            return f"禁言失败: {str(e)}"
+
+    return mute_user
+
+
 def create_relation_tool(
     db_session,
     session_id: str,
@@ -1209,11 +1329,38 @@ async def create_chat_agent(
     history: list[ChatHistorySchema] | None = None,
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
+    bot_id: str | None = None,
 ):
     """创建聊天 Agent。"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
     group_context = await get_group_context(db_session, session_id)
     recent_relations_context = await get_recent_relations_context(db_session, history or [])
+    has_admin_permission = False
+    if interface is not None and bot_id:
+        try:
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            for member in members:
+                if str(member.id) != str(bot_id):
+                    continue
+                bot_role = getattr(getattr(member, "role", None), "name", None)
+                has_admin_permission = bot_role in {"owner", "admin"}
+                break
+        except Exception as e:
+            logger.warning(f"检查 bot 管理权限失败: {e}")
+
+    permission_status = ""
+    mute_tool_instruction = ""
+    if has_admin_permission:
+        permission_status = """
+【你的权限】
+你在这个群里是管理员或群主，必要时可以使用禁言工具维护秩序。
+"""
+        mute_tool_instruction = """- 禁言管理：可使用 `mute_user`
+  - 用户明确要求“禁言我”“让我冷静一下”时，可以满足
+  - 禁言他人时要谨慎，优先用于严重刷屏、恶意骚扰、明显违规
+  - 轻微问题先提醒，禁言时长保持合理
+  - 不要禁言管理员或群主
+"""
     system_prompt = f"""你是QQ群群友「{plugin_config.bot_name}」。
 你不是助手，不承认自己是AI。
 
@@ -1222,6 +1369,7 @@ async def create_chat_agent(
 {group_context}
 {relation_context}
 {recent_relations_context}
+{permission_status}
 
 【风格】
 - 像真实群友，口语化、简短自然
@@ -1242,6 +1390,7 @@ async def create_chat_agent(
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到“年度报告 / 个人总结 / 成分分析”，直接调用 `generate_and_send_annual_report`；
   工具完成后只回复“请查收~”，不要复述报告
+{mute_tool_instruction}
 - 回复结束后调用 `finish`
 
 【边界】
@@ -1277,6 +1426,14 @@ async def create_chat_agent(
         request_id,
         user_id,
     )
+    mute_tool = create_mute_tool(
+        session_id,
+        request_id,
+        interface,
+        bot_id,
+        user_id or None,
+        user_name,
+    )
 
     if not user_id or not user_name:
         tools = [
@@ -1290,6 +1447,8 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        if has_admin_permission:
+            tools.insert(-1, mute_tool)
     else:
         tools = [
             search_web,
@@ -1303,6 +1462,8 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        if has_admin_permission:
+            tools.insert(-1, mute_tool)
 
     middleware = None
     if ToolCallLimitMiddleware is not None:
@@ -1441,6 +1602,7 @@ async def choice_response_strategy(
     setting: str | None = None,
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
+    bot_id: str | None = None,
 ):
     """
     使用 Agent 决定回复策略。
@@ -1455,6 +1617,7 @@ async def choice_response_strategy(
             history,
             interface,
             role_map,
+            bot_id,
         )
 
         chat_history_messages = await format_chat_history(

@@ -110,6 +110,7 @@ class ReplyRequest:
     session: Uninfo
     interface: QryItrface
     bot_name: str
+    bot_id: str
     user_id: str
     user_name: str | None
     is_tome: bool
@@ -151,6 +152,7 @@ async def _run_group_reply_worker(group_id: str) -> None:
                     request.session,
                     request.interface,
                     request.bot_name,
+                    request.bot_id,
                     request.user_id,
                     request.user_name,
                     request.is_tome,
@@ -837,6 +839,7 @@ async def handle_message(
             session=session,
             interface=interface,
             bot_name=plugin_config.bot_name,
+            bot_id=str(bot.self_id),
             user_id=user_id,
             user_name=user_name,
             is_tome=to_me,
@@ -981,6 +984,7 @@ async def handle_reply_logic(
     session: Uninfo,
     interface: QryItrface,
     bot_name: str,
+    bot_id: str,
     user_id: str,
     user_name: str | None,
     is_tome: bool,
@@ -1075,6 +1079,7 @@ async def handle_reply_logic(
                     plugin_config.personality_setting,
                     interface,
                     role_map,
+                    bot_id,
                 ),
                 timeout=240.0,
             )
