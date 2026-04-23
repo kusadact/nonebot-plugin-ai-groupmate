@@ -1580,10 +1580,12 @@ async def format_chat_history(
     history: list[ChatHistorySchema],
     max_inline_images: int = 3,
     user_roles: dict[str, str] | None = None,
+    bound_images: list[dict[str, str]] | None = None,
 ) -> list[BaseMessage]:
     """将最近图片以内联多模态格式喂给主模型，旧图片退化为文本。"""
     messages: list[BaseMessage] = []
     user_roles = user_roles or {}
+    bound_images = bound_images or []
 
     def _role_prefix(uid: str) -> str:
         role = user_roles.get(uid)
@@ -1608,7 +1610,10 @@ async def format_chat_history(
         id_to_summary[own_id] = f'{display_name} "{snippet}"'
 
     image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
-    inline_image_set = set(image_indices[-max_inline_images:]) if max_inline_images > 0 else set()
+    if bound_images:
+        inline_image_set: set[int] = set()
+    else:
+        inline_image_set = set(image_indices[-max_inline_images:]) if max_inline_images > 0 else set()
     inline_media_ids = [
         int(history[i].media_id)
         for i in inline_image_set
@@ -1670,6 +1675,30 @@ async def format_chat_history(
             fallback = f"{prefix_text} [图片]"
             messages.append(HumanMessage(content=fallback))
 
+    if bound_images:
+        parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": "【当前重点图片】以下图片与本轮问题直接相关，优先分析这些图片，不要把其他历史图片当成当前问题对象。",
+            }
+        ]
+        for idx, image in enumerate(bound_images, 1):
+            image_url = (image.get("image_url") or "").strip()
+            if not image_url:
+                continue
+
+            label = (image.get("label") or f"重点图{idx}").strip()
+            note = (image.get("note") or "").strip()
+            text = f"\n重点图{idx}（{label}）"
+            if note:
+                text += f"，简述：{note}"
+            text += "："
+            parts.append({"type": "text", "text": text})
+            parts.append({"type": "image_url", "image_url": {"url": image_url}})
+
+        if len(parts) > 1:
+            messages.append(HumanMessage(content=parts))
+
     return messages
 
 
@@ -1684,6 +1713,7 @@ async def choice_response_strategy(
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
+    bound_images: list[dict[str, str]] | None = None,
 ):
     """
     使用 Agent 决定回复策略。
@@ -1705,6 +1735,7 @@ async def choice_response_strategy(
             db_session,
             history,
             user_roles=role_map,
+            bound_images=bound_images,
         )
 
         today = datetime.datetime.now()
@@ -1717,6 +1748,7 @@ async def choice_response_strategy(
 【任务】
 请根据上述对话历史，判断是否需要回复。如果需要，请调用相应工具。
 如果是针对图片的消息，请结合图片内容回答。
+如果上文包含“【当前重点图片】”，优先围绕这些图片回答。
 如果不需要回复，请保持沉默。
 """
 

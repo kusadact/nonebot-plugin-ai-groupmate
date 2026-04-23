@@ -114,6 +114,7 @@ class ReplyRequest:
     user_id: str
     user_name: str | None
     is_tome: bool
+    bound_images: list[dict[str, str]]
 
 
 @dataclass
@@ -156,6 +157,7 @@ async def _run_group_reply_worker(group_id: str) -> None:
                     request.user_id,
                     request.user_name,
                     request.is_tome,
+                    request.bound_images,
                 )
     finally:
         async with _group_reply_state_lock:
@@ -436,6 +438,137 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _extract_content_body(content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+
+    body_start = 0
+    if lines[0].startswith("id:"):
+        body_start = 1
+        if len(lines) > 1 and lines[1].startswith("回复id:"):
+            body_start = 2
+
+    return "\n".join(lines[body_start:]).strip()
+
+
+def _guess_image_format(raw_id: str | None) -> str:
+    image_id = str(raw_id or "").strip()
+    if "." in image_id:
+        ext = image_id.rsplit(".", 1)[-1].strip().lower()
+        if ext:
+            return ext
+    return "jpg"
+
+
+def _image_bytes_to_data_uri(image_bytes: bytes, image_format: str | None = None) -> str:
+    normalized_format = (image_format or "jpg").strip().lower()
+    mime_type = mimetypes.guess_type(f"image.{normalized_format}")[0] or f"image/{normalized_format}"
+    payload = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{payload}"
+
+
+async def _build_current_event_bound_images(
+    imgs: list[Image],
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    max_images: int = 3,
+) -> list[dict[str, str]]:
+    bound_images: list[dict[str, str]] = []
+
+    for idx, img in enumerate(imgs[:max_images]):
+        image_format = _guess_image_format(getattr(img, "id", None))
+        try:
+            image_bytes = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
+            image_bytes = await asyncio.to_thread(
+                check_and_compress_image_bytes,
+                image_bytes,
+                image_format=image_format.upper(),
+            )
+            bound_images.append(
+                {
+                    "label": "当前消息图片" if idx == 0 else f"当前消息图片{idx + 1}",
+                    "image_url": _image_bytes_to_data_uri(image_bytes, image_format),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"构建当前消息重点图片失败 idx={idx} error={type(e).__name__}: {e}")
+
+    return bound_images
+
+
+async def _build_reply_bound_images(
+    db_session,
+    session_id: str,
+    reply_to_message_id: str | None,
+) -> list[dict[str, str]]:
+    if not reply_to_message_id:
+        return []
+
+    normalized_reply_id = str(reply_to_message_id).strip()
+    if not normalized_reply_id:
+        return []
+
+    base_stmt = (
+        Select(ChatHistory)
+        .where(
+            ChatHistory.session_id == session_id,
+            ChatHistory.content_type == "image",
+        )
+        .order_by(desc(ChatHistory.created_at))
+    )
+    stmt = base_stmt.where(ChatHistory.content.contains(f"id: {normalized_reply_id}\n")).limit(1)
+    msg = (await db_session.execute(stmt)).scalar_one_or_none()
+    if msg is None:
+        stmt = base_stmt.where(ChatHistory.content.contains(f"id:{normalized_reply_id}\n")).limit(1)
+        msg = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    if msg is None or msg.media_id is None:
+        return []
+
+    media_obj = await db_session.get(MediaStorage, msg.media_id)
+    if media_obj is None or not media_obj.file_path:
+        return []
+
+    file_path = pic_dir / media_obj.file_path
+    if not file_path.exists():
+        return []
+
+    try:
+        image_url = _image_to_data_uri(file_path)
+    except Exception as e:
+        logger.warning(f"读取被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+        return []
+
+    bound_image = {
+        "label": "被回复图片",
+        "image_url": image_url,
+    }
+    note = _extract_content_body(msg.content)
+    if note and note != "[图片]":
+        bound_image["note"] = note[:80]
+
+    return [bound_image]
+
+
+async def _build_bound_images(
+    db_session,
+    imgs: list[Image],
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session_id: str,
+    reply_to_message_id: str | None,
+) -> list[dict[str, str]]:
+    bound_images: list[dict[str, str]] = []
+    if imgs:
+        bound_images.extend(await _build_current_event_bound_images(imgs, event, bot, state))
+    if reply_to_message_id:
+        bound_images.extend(await _build_reply_bound_images(db_session, session_id, reply_to_message_id))
+    return bound_images
 
 
 async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
@@ -834,6 +967,15 @@ async def handle_message(
 
     if should_reply:
         group_id = session.scene.id
+        bound_images = await _build_bound_images(
+            db_session,
+            imgs,
+            event,
+            bot,
+            state,
+            group_id,
+            reply_to_message_id,
+        )
         request = ReplyRequest(
             request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
             session=session,
@@ -843,6 +985,7 @@ async def handle_message(
             user_id=user_id,
             user_name=user_name,
             is_tome=to_me,
+            bound_images=bound_images,
         )
         await set_latest_request_id(group_id, request.request_id)
         async with _group_reply_state_lock:
@@ -988,6 +1131,7 @@ async def handle_reply_logic(
     user_id: str,
     user_name: str | None,
     is_tome: bool,
+    bound_images: list[dict[str, str]] | None = None,
 ):
     """处理回复逻辑"""
     try:
@@ -1080,6 +1224,7 @@ async def handle_reply_logic(
                     interface,
                     role_map,
                     bot_id,
+                    bound_images,
                 ),
                 timeout=240.0,
             )
