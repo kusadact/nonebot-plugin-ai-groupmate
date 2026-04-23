@@ -572,6 +572,163 @@ def create_reply_tool(
             deduped.append(line)
         return "\n".join(deduped)
 
+    def _split_reply_segments(text: str) -> list[str]:
+        normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized_text:
+            return []
+
+        deduped_text = _dedupe_consecutive_lines(normalized_text)
+        raw_segments = [line.strip() for line in deduped_text.split("\n") if line.strip()]
+        if not raw_segments:
+            return []
+
+        segments: list[str] = []
+        for raw_segment in raw_segments:
+            normalized_segment = _normalize_text(raw_segment)
+            if not normalized_segment:
+                continue
+
+            if segments:
+                previous_segment = _normalize_text(segments[-1])
+                if _semantic_similarity(previous_segment, normalized_segment) >= 0.9:
+                    continue
+
+            if len(segments) < 3:
+                segments.append(raw_segment)
+            else:
+                segments[-1] = f"{segments[-1]} {raw_segment}".strip()
+
+        return segments
+
+    async def _build_name_to_id_map() -> dict[str, str]:
+        name_to_id: dict[str, str] = {}
+        if interface is None:
+            return name_to_id
+
+        try:
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            for member in members:
+                target_id = str(member.id)
+                aliases = {
+                    getattr(member, "name", None),
+                    getattr(member, "nick", None),
+                    getattr(getattr(member, "user", None), "name", None),
+                    getattr(getattr(member, "user", None), "nick", None),
+                }
+                for alias in aliases:
+                    if alias:
+                        name_to_id[str(alias)] = target_id
+        except Exception as e:
+            logger.warning(f"获取群成员失败，降级为纯文本发送: {e}")
+
+        return name_to_id
+
+    async def _get_latest_bot_message() -> ChatHistory | None:
+        return (
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session_id,
+                        ChatHistory.content_type == "bot",
+                    )
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    async def _is_recent_duplicate(content: str) -> bool:
+        latest_bot_msg = await _get_latest_bot_message()
+        if not latest_bot_msg:
+            return False
+
+        _, _, latest_body = _parse_msg_meta(latest_bot_msg.content)
+        latest_normalized = _normalize_text(latest_body or latest_bot_msg.content)
+        normalized_content = _normalize_text(content)
+        recent = datetime.datetime.now() - latest_bot_msg.created_at <= datetime.timedelta(seconds=90)
+        similarity = _semantic_similarity(latest_normalized, normalized_content)
+        if recent and similarity >= 0.9:
+            logger.info(f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过")
+            return True
+        return False
+
+    def _build_reply_message(content: str, name_to_id: dict[str, str]) -> UniMessage:
+        at_pattern = re.compile(r"@([^\s@]+)")
+        punctuation = "，。,.!！?？:：;；、)）]\"'”’"
+        message: UniMessage | None = None
+
+        def append_text(text: str) -> None:
+            nonlocal message
+            if not text:
+                return
+            if message is None:
+                message = UniMessage.text(text)
+            else:
+                message = message.text(text)
+
+        def append_at(target_id: str) -> bool:
+            nonlocal message
+            try:
+                if message is None:
+                    message = UniMessage.at(target_id)
+                else:
+                    message = message.at(target_id)
+                return True
+            except Exception:
+                return False
+
+        cursor = 0
+        for match in at_pattern.finditer(content):
+            start, end = match.span()
+            raw_name = match.group(1)
+            mention_name = raw_name
+            suffix = ""
+            while mention_name and mention_name[-1] in punctuation:
+                suffix = mention_name[-1] + suffix
+                mention_name = mention_name[:-1]
+
+            target_id = name_to_id.get(mention_name)
+            if not target_id:
+                continue
+
+            append_text(content[cursor:start])
+            if not append_at(target_id):
+                append_text("@" + mention_name)
+            append_text(suffix)
+            cursor = end
+
+        append_text(content[cursor:])
+        return message or UniMessage.text(content)
+
+    async def _send_reply_segment(content: str, name_to_id: dict[str, str]) -> str:
+        if request_id is not None and not await is_request_active(session_id, request_id):
+            return "expired"
+
+        if await _is_recent_duplicate(content):
+            return "duplicate"
+
+        message = _build_reply_message(content, name_to_id)
+
+        if request_id is not None and not await is_request_active(session_id, request_id):
+            return "expired"
+
+        res = await message.send()
+        msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
+        chat_history = ChatHistory(
+            session_id=session_id,
+            user_id=plugin_config.bot_name,
+            content_type="bot",
+            content=f"id: {msg_id}\n" + content,
+            user_name=plugin_config.bot_name,
+        )
+        db_session.add(chat_history)
+        await db_session.flush()
+        logger.info(f"Bot已回复: {content}")
+        return "sent"
+
     @tool("reply_user")
     async def reply_user(content: str) -> str:
         """
@@ -587,112 +744,34 @@ def create_reply_tool(
             return "内容为空，未发送。"
 
         try:
-            content = _dedupe_consecutive_lines(content.strip())
-            normalized_content = _normalize_text(content)
+            segments = _split_reply_segments(content)
+            if not segments:
+                return "内容为空，未发送。"
 
-            latest_bot_msg = (
-                (
-                    await db_session.execute(
-                        Select(ChatHistory)
-                        .where(
-                            ChatHistory.session_id == session_id,
-                            ChatHistory.content_type == "bot",
-                        )
-                        .order_by(ChatHistory.msg_id.desc())
-                        .limit(1)
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if latest_bot_msg:
-                _, _, latest_body = _parse_msg_meta(latest_bot_msg.content)
-                latest_normalized = _normalize_text(latest_body or latest_bot_msg.content)
-                recent = datetime.datetime.now() - latest_bot_msg.created_at <= datetime.timedelta(seconds=90)
-                similarity = _semantic_similarity(latest_normalized, normalized_content)
-                if recent and similarity >= 0.9:
-                    logger.info(f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过")
-                    return "检测到重复回复，已跳过发送。"
+            name_to_id = await _build_name_to_id_map()
+            sent_count = 0
+            duplicate_count = 0
 
-            name_to_id: dict[str, str] = {}
-            if interface is not None:
-                try:
-                    members = await interface.get_members(SceneType.GROUP, session_id)
-                    for member in members:
-                        target_id = str(member.id)
-                        aliases = {
-                            getattr(member, "name", None),
-                            getattr(member, "nick", None),
-                            getattr(getattr(member, "user", None), "name", None),
-                            getattr(getattr(member, "user", None), "nick", None),
-                        }
-                        for alias in aliases:
-                            if alias:
-                                name_to_id[str(alias)] = target_id
-                except Exception as e:
-                    logger.warning(f"获取群成员失败，降级为纯文本发送: {e}")
-
-            at_pattern = re.compile(r"@([^\s@]+)")
-            punctuation = "，。,.!！?？:：;；、)）]\"'”’"
-            message: UniMessage | None = None
-
-            def append_text(text: str) -> None:
-                nonlocal message
-                if not text:
-                    return
-                if message is None:
-                    message = UniMessage.text(text)
-                else:
-                    message = message.text(text)
-
-            def append_at(target_id: str) -> bool:
-                nonlocal message
-                try:
-                    if message is None:
-                        message = UniMessage.at(target_id)
-                    else:
-                        message = message.at(target_id)
-                    return True
-                except Exception:
-                    return False
-
-            cursor = 0
-            for match in at_pattern.finditer(content):
-                start, end = match.span()
-                raw_name = match.group(1)
-                mention_name = raw_name
-                suffix = ""
-                while mention_name and mention_name[-1] in punctuation:
-                    suffix = mention_name[-1] + suffix
-                    mention_name = mention_name[:-1]
-
-                target_id = name_to_id.get(mention_name)
-                if not target_id:
+            for index, segment in enumerate(segments):
+                result = await _send_reply_segment(segment, name_to_id)
+                if result == "expired":
+                    if sent_count > 0:
+                        return f"请求已过期，已发送 {sent_count} 条。"
+                    return "请求已过期，已取消发送。"
+                if result == "duplicate":
+                    duplicate_count += 1
                     continue
 
-                append_text(content[cursor:start])
-                if not append_at(target_id):
-                    append_text("@" + mention_name)
-                append_text(suffix)
-                cursor = end
+                sent_count += 1
+                if index < len(segments) - 1:
+                    await asyncio.sleep(0.35)
 
-            append_text(content[cursor:])
+            if sent_count > 0:
+                if duplicate_count > 0:
+                    return f"回复已成功发送，共 {sent_count} 条，跳过重复内容 {duplicate_count} 条。"
+                return f"回复已成功发送，共 {sent_count} 条。"
 
-            if request_id is not None and not await is_request_active(session_id, request_id):
-                return "请求已过期，已取消发送。"
-
-            res = await (message or UniMessage.text(content)).send()
-            msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=plugin_config.bot_name,
-                content_type="bot",
-                content=f"id: {msg_id}\n" + content,
-                user_name=plugin_config.bot_name,
-            )
-            db_session.add(chat_history)
-            logger.info(f"Bot已回复: {content}")
-            return "回复已成功发送。"
+            return "检测到重复回复，已跳过发送。"
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
             await db_session.rollback()
@@ -1373,7 +1452,9 @@ async def create_chat_agent(
 
 【风格】
 - 像真实群友，口语化、简短自然
-- 优先短句；复杂问题可拆成 2-3 条连续短消息（每条一个重点）
+- 优先短句；默认只调用一次 `reply_user`
+- 如果确实需要连续发 2-3 条短消息，请在同一次 `reply_user` 的 content 中用换行分隔，每行一个重点
+- 不要为了拆句多次调用 `reply_user`
 - 多条回复必须信息递进，后一条必须提供新信息，禁止同义改写重复
 - 如果下一条和上一条语义高度重叠，直接不发下一条
 - 可吐槽可玩梗，但不恶意攻击，不无脑迎合
@@ -1470,7 +1551,7 @@ async def create_chat_agent(
         try:
             middleware = [
                 ToolCallLimitMiddleware(run_limit=8),
-                ToolCallLimitMiddleware(tool_name="reply_user", run_limit=3),
+                ToolCallLimitMiddleware(tool_name="reply_user", run_limit=1),
                 ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=1),
             ]
         except Exception as e:
