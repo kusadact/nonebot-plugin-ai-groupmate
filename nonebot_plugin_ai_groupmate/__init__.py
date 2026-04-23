@@ -9,6 +9,7 @@ import mimetypes
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config, get_driver
@@ -44,6 +45,7 @@ from .utils import (
 )
 from .config import Config
 from .memory import DB
+from .reply_guard import set_latest_request_id
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -100,6 +102,68 @@ multimodal_model = (
     if plugin_config.multimodal_model and _multimodal_api_key
     else None
 )
+
+
+@dataclass
+class ReplyRequest:
+    request_id: str
+    session: Uninfo
+    interface: QryItrface
+    bot_name: str
+    user_id: str
+    user_name: str | None
+    is_tome: bool
+
+
+@dataclass
+class GroupReplyState:
+    running: bool = False
+    latest: ReplyRequest | None = None
+    task: asyncio.Task | None = None
+
+
+_group_reply_states: dict[str, GroupReplyState] = {}
+_group_reply_state_lock = asyncio.Lock()
+
+
+def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState) -> None:
+    state.running = True
+    state.task = asyncio.create_task(_run_group_reply_worker(group_id))
+
+
+async def _run_group_reply_worker(group_id: str) -> None:
+    try:
+        while True:
+            async with _group_reply_state_lock:
+                state = _group_reply_states.get(group_id)
+                if not state:
+                    return
+                request = state.latest
+                state.latest = None
+
+            if request is None:
+                break
+
+            async with get_session() as reply_session:
+                await handle_reply_logic(
+                    reply_session,
+                    request.request_id,
+                    request.session,
+                    request.interface,
+                    request.bot_name,
+                    request.user_id,
+                    request.user_name,
+                    request.is_tome,
+                )
+    finally:
+        async with _group_reply_state_lock:
+            state = _group_reply_states.get(group_id)
+            if not state:
+                return
+            state.running = False
+            state.task = None
+            if state.latest is not None:
+                _start_group_reply_worker_locked(group_id, state)
 
 
 def _extract_model_text(content: Any) -> str:
@@ -623,16 +687,25 @@ record = on_message(
 
 
 @record.handle()
-async def handle_message(db_session: async_scoped_session, msg: UniMsg, session: Uninfo, event: Event, bot: Bot, state: T_State, interface: QryItrface):
+async def handle_message(
+    db_session: async_scoped_session,
+    msg: UniMsg,
+    session: Uninfo,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    interface: QryItrface,
+):
     """处理消息的主函数"""
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
+    body = ""
     to_me = False
     is_text = False
     reply_to_message_id: str | None = None
     if event.is_tome() or _event_at_bot(event, bot):
         to_me = True
-        content += f"@{plugin_config.bot_name} "
+        body += f"@{plugin_config.bot_name} "
 
     at_targets: list[str] = []
     for i in msg:
@@ -649,7 +722,7 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
                     break
             else:
                 continue
-            content += "@" + name + " "
+            body += "@" + name + " "
             is_text = True
         if i.type == "reply":
             rid = str(getattr(i, "id", "") or "").strip()
@@ -661,9 +734,8 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
                 rid = str(getattr(i, "message_id", "") or "").strip()
             if rid and not reply_to_message_id:
                 reply_to_message_id = rid
-                content += "回复id:" + rid
         if i.type == "text":
-            content += i.text
+            body += i.text
             is_text = True
 
     if not reply_to_message_id:
@@ -673,18 +745,14 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         if m:
             reply_to_message_id = m.group(1)
 
-    # 构建用户名（包含昵称和职位）
-    user_name = session.user.name
-    if session.member:
-        if session.member.nick:
-            user_name = f"({session.member.nick}){user_name}"
-        if session.member.role:
-            if session.member.role.name == "owner":
-                user_name = f"群主-{user_name}"
-            elif session.member.role.name == "admin":
-                user_name = f"管理员-{user_name}"
+    if reply_to_message_id:
+        content += f"回复id: {reply_to_message_id}\n"
+    content += body
 
-    # ========== 步骤1: 处理文本消息（快速） ==========
+    user_name = session.user.name or session.user.nick or session.user.id
+    if session.member and session.member.nick:
+        user_name = session.member.nick
+
     if is_text:
         chat_history = ChatHistory(
             session_id=session.scene.id,
@@ -695,18 +763,26 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         )
         db_session.add(chat_history)
 
-    # 立即提交文本消息
     try:
         await db_session.commit()
     except Exception as e:
         logger.error(f"保存文本消息失败: {e}")
         await db_session.rollback()
 
-    # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
     image_content_prefix = f"id: {get_message_id()}\n"
+    if reply_to_message_id:
+        image_content_prefix += f"回复id: {reply_to_message_id}\n"
     for img in imgs:
         asyncio.create_task(
-            _process_image_task(img, event, bot, state, session, user_name, image_content_prefix)
+            _process_image_task(
+                img,
+                event,
+                bot,
+                state,
+                session,
+                user_name,
+                image_content_prefix,
+            )
         )
 
     plain_text = (msg.extract_plain_text() or event.get_plaintext() or "").strip()
@@ -724,9 +800,7 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
     if not _is_enabled():
         return
 
-    # ========== 步骤3: 决定是否回复 ==========
     plain_event_text = event.get_plaintext() or ""
-
     bot_name_l = (plugin_config.bot_name or "").strip().lower()
     if bot_name_l and (
         plain_text.lower().startswith(bot_name_l)
@@ -746,23 +820,42 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         should_reply = False
     if plain_event_text.startswith(("!", "！", "/", "#", "?", "\\")):
         should_reply = False
-    if not plain_event_text and not event.is_tome():
+    if not plain_event_text and not to_me:
         should_reply = False
+
     if to_me:
         user_id = session.user.id
         user_name = session.user.name or session.user.nick
     else:
         user_id = ""
         user_name = ""
+
     if should_reply:
-        await handle_reply_logic(
-            db_session,
-            session,
-            plugin_config.bot_name,
-            user_id,
-            user_name,
-            to_me,
+        group_id = session.scene.id
+        request = ReplyRequest(
+            request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
+            session=session,
+            interface=interface,
+            bot_name=plugin_config.bot_name,
+            user_id=user_id,
+            user_name=user_name,
+            is_tome=to_me,
         )
+        await set_latest_request_id(group_id, request.request_id)
+        async with _group_reply_state_lock:
+            reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
+            reply_state.latest = request
+            if reply_state.running:
+                if reply_state.task and not reply_state.task.done():
+                    reply_state.task.cancel()
+                    logger.info(f"群 {group_id} 收到更新请求，已取消旧回复并切换到最新")
+                else:
+                    logger.warning(
+                        f"群 {group_id} 回复状态异常（running=True 但 worker 不可用），已重启并切换到最新请求"
+                    )
+                    _start_group_reply_worker_locked(group_id, reply_state)
+            else:
+                _start_group_reply_worker_locked(group_id, reply_state)
 
     await db_session.commit()
 
@@ -884,7 +977,9 @@ def _clean_gate_text(content: str) -> str:
 
 async def handle_reply_logic(
     db_session,
+    request_id: str,
     session: Uninfo,
+    interface: QryItrface,
     bot_name: str,
     user_id: str,
     user_name: str | None,
@@ -892,15 +987,21 @@ async def handle_reply_logic(
 ):
     """处理回复逻辑"""
     try:
-        # 非 @bot / 非明确点名时，先做一次轻量前置判断，避免频繁启动主 Agent。
         recent_msgs = (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id)
-                .order_by(ChatHistory.msg_id.desc())
-                .limit(3)
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session.scene.id,
+                        ChatHistory.content_type != "bot",
+                    )
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(3)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         recent_msgs = recent_msgs[::-1]
 
         if not recent_msgs:
@@ -929,36 +1030,66 @@ async def handle_reply_logic(
                 logger.debug(f"前置判断拒绝回复 session={session.scene.id}")
                 return
 
-        # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
-        last_msg = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session.scene.id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(20))).scalars().all()
+        last_msg = (
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(ChatHistory.session_id == session.scene.id)
+                    .where(ChatHistory.created_at >= cutoff_time)
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(20)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
 
-        # 转换为模型对象并反转顺序（从旧到新）
         last_msg = [ChatHistorySchema.model_validate(m) for m in last_msg]
         last_msg = last_msg[::-1]
 
-        # 使用Agent决定回复策略
+        role_map: dict[str, str] = {}
+        try:
+            members = await interface.get_members(SceneType.GROUP, session.scene.id)
+            for member in members:
+                role_name = getattr(getattr(member, "role", None), "name", None)
+                if role_name in {"owner", "admin"}:
+                    role_map[str(member.id)] = role_name
+        except Exception as e:
+            logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
+
         logger.info("开始调用Agent决策...")
         try:
             await asyncio.wait_for(
                 choice_response_strategy(
                     db_session,
                     session.scene.id,
+                    request_id,
                     last_msg,
                     user_id,
                     user_name,
                     plugin_config.personality_setting,
+                    interface,
+                    role_map,
                 ),
-                timeout=120.0,
+                timeout=240.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时，跳过回复 - session: {session.scene.id}")
             return
+        except asyncio.CancelledError:
+            logger.info(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
+            await db_session.rollback()
+            raise
 
+    except asyncio.CancelledError:
+        logger.info(f"群 {session.scene.id} 回复任务被取消（主流程中断）")
+        await db_session.rollback()
+        raise
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()
