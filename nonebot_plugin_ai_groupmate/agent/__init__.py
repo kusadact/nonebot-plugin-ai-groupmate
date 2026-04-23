@@ -1581,6 +1581,8 @@ async def format_chat_history(
     max_inline_images: int = 3,
     user_roles: dict[str, str] | None = None,
     bound_images: list[dict[str, str]] | None = None,
+    disable_inline_history_images: bool = False,
+    binding_notice: str | None = None,
 ) -> list[BaseMessage]:
     """将最近图片以内联多模态格式喂给主模型，旧图片退化为文本。"""
     messages: list[BaseMessage] = []
@@ -1610,7 +1612,7 @@ async def format_chat_history(
         id_to_summary[own_id] = f'{display_name} "{snippet}"'
 
     image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
-    if bound_images:
+    if bound_images or disable_inline_history_images:
         inline_image_set: set[int] = set()
     else:
         inline_image_set = set(image_indices[-max_inline_images:]) if max_inline_images > 0 else set()
@@ -1675,6 +1677,9 @@ async def format_chat_history(
             fallback = f"{prefix_text} [图片]"
             messages.append(HumanMessage(content=fallback))
 
+    if binding_notice:
+        messages.append(HumanMessage(content=binding_notice))
+
     if bound_images:
         parts: list[dict[str, Any]] = [
             {
@@ -1714,6 +1719,8 @@ async def choice_response_strategy(
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
     bound_images: list[dict[str, str]] | None = None,
+    disable_inline_history_images: bool = False,
+    binding_notice: str | None = None,
 ):
     """
     使用 Agent 决定回复策略。
@@ -1736,6 +1743,8 @@ async def choice_response_strategy(
             history,
             user_roles=role_map,
             bound_images=bound_images,
+            disable_inline_history_images=disable_inline_history_images,
+            binding_notice=binding_notice,
         )
 
         today = datetime.datetime.now()

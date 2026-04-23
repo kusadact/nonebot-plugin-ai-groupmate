@@ -6,6 +6,7 @@ import json
 import re
 import base64
 import mimetypes
+import urllib.request
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,8 @@ class ReplyRequest:
     user_name: str | None
     is_tome: bool
     bound_images: list[dict[str, str]]
+    disable_inline_history_images: bool
+    binding_notice: str | None
 
 
 @dataclass
@@ -158,6 +161,8 @@ async def _run_group_reply_worker(group_id: str) -> None:
                     request.user_name,
                     request.is_tome,
                     request.bound_images,
+                    request.disable_inline_history_images,
+                    request.binding_notice,
                 )
     finally:
         async with _group_reply_state_lock:
@@ -456,6 +461,7 @@ def _extract_content_body(content: str) -> str:
 
 def _guess_image_format(raw_id: str | None) -> str:
     image_id = str(raw_id or "").strip()
+    image_id = image_id.split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
     if "." in image_id:
         ext = image_id.rsplit(".", 1)[-1].strip().lower()
         if ext:
@@ -468,6 +474,210 @@ def _image_bytes_to_data_uri(image_bytes: bytes, image_format: str | None = None
     mime_type = mimetypes.guess_type(f"image.{normalized_format}")[0] or f"image/{normalized_format}"
     payload = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{payload}"
+
+
+def _iter_message_segments(message_obj: Any):
+    if message_obj is None:
+        return
+
+    if isinstance(message_obj, dict):
+        seg_type = message_obj.get("type")
+        if seg_type:
+            yield message_obj
+        return
+
+    if isinstance(message_obj, (bytes, bytearray)):
+        message_obj = message_obj.decode("utf-8", errors="ignore")
+
+    if isinstance(message_obj, str):
+        for match in re.finditer(r"\[CQ:(\w+),([^\]]*)\]", message_obj):
+            seg_data: dict[str, str] = {}
+            raw_data = match.group(2)
+            if raw_data:
+                for item in raw_data.split(","):
+                    if "=" not in item:
+                        continue
+                    key, value = item.split("=", 1)
+                    seg_data[key] = value
+            yield {"type": match.group(1), "data": seg_data}
+        return
+
+    try:
+        iterator = iter(message_obj)
+    except TypeError:
+        return
+
+    for seg in iterator:
+        yield seg
+
+
+def _segment_type_and_data(seg: Any) -> tuple[str | None, dict[str, Any]]:
+    if isinstance(seg, dict):
+        seg_type = seg.get("type")
+        seg_data = seg.get("data") or {}
+        return seg_type, seg_data if isinstance(seg_data, dict) else {}
+
+    seg_type = getattr(seg, "type", None)
+    seg_data = getattr(seg, "data", None) or {}
+    return seg_type, seg_data if isinstance(seg_data, dict) else {}
+
+
+def _extract_text_from_message_obj(message_obj: Any) -> str:
+    parts: list[str] = []
+    for seg in _iter_message_segments(message_obj):
+        seg_type, seg_data = _segment_type_and_data(seg)
+        if seg_type != "text":
+            continue
+        text = str(seg_data.get("text") or "").strip()
+        if text:
+            parts.append(text)
+
+    if parts:
+        return " ".join(parts)
+
+    if isinstance(message_obj, str):
+        text = re.sub(r"\[CQ:[^\]]+\]", "", message_obj)
+        return re.sub(r"\s+", " ", text).strip()
+
+    return ""
+
+
+def _download_bytes_from_url(url: str, timeout: float = 15.0) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "nonebot-plugin-ai-groupmate/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _extract_reply_payload_from_event(event: Event, reply_to_message_id: str) -> Any | None:
+    event_reply = getattr(event, "reply", None)
+    if event_reply is None:
+        return None
+
+    payload_reply_id = getattr(event_reply, "message_id", None) or getattr(event_reply, "id", None)
+    if payload_reply_id is None:
+        return event_reply
+
+    if str(payload_reply_id).strip() == str(reply_to_message_id).strip():
+        return event_reply
+    return None
+
+
+async def _resolve_reply_image_source(
+    bot: Bot,
+    seg_data: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    direct_url = str(seg_data.get("url") or "").strip()
+    if direct_url:
+        return "url", direct_url
+
+    file_id = str(seg_data.get("file") or "").strip()
+    if not file_id:
+        return None, None
+
+    try:
+        image_info = await asyncio.wait_for(bot.call_api("get_image", file=file_id), timeout=10.0)
+    except Exception as e:
+        logger.warning(f"通过 get_image 获取被回复图片失败 file={file_id}: {type(e).__name__}: {e}")
+        return None, None
+
+    local_path = str((image_info or {}).get("file") or "").strip()
+    if local_path and Path(local_path).exists():
+        return "path", local_path
+
+    image_url = str((image_info or {}).get("url") or "").strip()
+    if image_url:
+        return "url", image_url
+
+    return None, None
+
+
+async def _build_reply_bound_images_from_payload(
+    bot: Bot,
+    payload: Any,
+    reply_to_message_id: str,
+    max_images: int = 3,
+) -> list[dict[str, str]]:
+    message_obj = getattr(payload, "message", None)
+    if message_obj is None and isinstance(payload, dict):
+        message_obj = payload.get("message")
+    if message_obj is None:
+        return []
+
+    note = _extract_text_from_message_obj(message_obj)
+    bound_images: list[dict[str, str]] = []
+
+    for seg in _iter_message_segments(message_obj):
+        seg_type, seg_data = _segment_type_and_data(seg)
+        if seg_type != "image":
+            continue
+
+        source_kind, source_value = await _resolve_reply_image_source(bot, seg_data)
+        if not source_kind or not source_value:
+            continue
+
+        image_format = _guess_image_format(seg_data.get("file") or source_value)
+        try:
+            if source_kind == "path":
+                image_bytes = await asyncio.to_thread(Path(source_value).read_bytes)
+            else:
+                image_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(_download_bytes_from_url, source_value, 15.0),
+                    timeout=20.0,
+                )
+            image_bytes = await asyncio.to_thread(
+                check_and_compress_image_bytes,
+                image_bytes,
+                image_format=image_format.upper(),
+            )
+        except Exception as e:
+            logger.warning(
+                f"读取被回复图片失败 msg_id={reply_to_message_id} source={source_kind}: {type(e).__name__}: {e}"
+            )
+            continue
+
+        bound_image = {
+            "label": "被回复图片" if not bound_images else f"被回复图片{len(bound_images) + 1}",
+            "image_url": _image_bytes_to_data_uri(image_bytes, image_format),
+        }
+        if note:
+            bound_image["note"] = note[:80]
+        bound_images.append(bound_image)
+        if len(bound_images) >= max_images:
+            break
+
+    return bound_images
+
+
+async def _build_reply_bound_images_from_api(
+    event: Event,
+    bot: Bot,
+    reply_to_message_id: str,
+    max_images: int = 3,
+) -> list[dict[str, str]]:
+    normalized_reply_id = str(reply_to_message_id).strip()
+    if not normalized_reply_id:
+        return []
+
+    payload = _extract_reply_payload_from_event(event, normalized_reply_id)
+    if payload is not None:
+        bound_images = await _build_reply_bound_images_from_payload(bot, payload, normalized_reply_id, max_images=max_images)
+        if bound_images:
+            logger.info(f"命中事件回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)}")
+            return bound_images
+
+    try:
+        payload = await asyncio.wait_for(
+            bot.call_api("get_msg", message_id=int(normalized_reply_id)),
+            timeout=10.0,
+        )
+    except Exception as e:
+        logger.warning(f"获取被回复消息失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+        return []
+
+    bound_images = await _build_reply_bound_images_from_payload(bot, payload, normalized_reply_id, max_images=max_images)
+    if bound_images:
+        logger.info(f"命中 API 回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)}")
+    return bound_images
 
 
 async def _build_current_event_bound_images(
@@ -504,13 +714,15 @@ async def _build_reply_bound_images(
     db_session,
     session_id: str,
     reply_to_message_id: str | None,
-) -> list[dict[str, str]]:
+    event: Event,
+    bot: Bot,
+) -> tuple[list[dict[str, str]], bool, str | None]:
     if not reply_to_message_id:
-        return []
+        return [], False, None
 
     normalized_reply_id = str(reply_to_message_id).strip()
     if not normalized_reply_id:
-        return []
+        return [], False, None
 
     base_stmt = (
         Select(ChatHistory)
@@ -526,32 +738,36 @@ async def _build_reply_bound_images(
         stmt = base_stmt.where(ChatHistory.content.contains(f"id:{normalized_reply_id}\n")).limit(1)
         msg = (await db_session.execute(stmt)).scalar_one_or_none()
 
-    if msg is None or msg.media_id is None:
-        return []
+    if msg is not None and msg.media_id is not None:
+        media_obj = await db_session.get(MediaStorage, msg.media_id)
+        if media_obj is not None and media_obj.file_path:
+            file_path = pic_dir / media_obj.file_path
+            if file_path.exists():
+                try:
+                    image_url = _image_to_data_uri(file_path)
+                    bound_image = {
+                        "label": "被回复图片",
+                        "image_url": image_url,
+                    }
+                    note = _extract_content_body(msg.content)
+                    if note and note != "[图片]":
+                        bound_image["note"] = note[:80]
+                    logger.info(f"命中本地被回复图片绑定 msg_id={normalized_reply_id} media_id={msg.media_id}")
+                    return [bound_image], False, None
+                except Exception as e:
+                    logger.warning(f"读取本地被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
 
-    media_obj = await db_session.get(MediaStorage, msg.media_id)
-    if media_obj is None or not media_obj.file_path:
-        return []
+    logger.info(f"本地未命中被回复图片，尝试 API 解析 msg_id={normalized_reply_id}")
+    api_bound_images = await _build_reply_bound_images_from_api(event, bot, normalized_reply_id)
+    if api_bound_images:
+        return api_bound_images, False, None
 
-    file_path = pic_dir / media_obj.file_path
-    if not file_path.exists():
-        return []
-
-    try:
-        image_url = _image_to_data_uri(file_path)
-    except Exception as e:
-        logger.warning(f"读取被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
-        return []
-
-    bound_image = {
-        "label": "被回复图片",
-        "image_url": image_url,
-    }
-    note = _extract_content_body(msg.content)
-    if note and note != "[图片]":
-        bound_image["note"] = note[:80]
-
-    return [bound_image]
+    notice = (
+        f"【图片绑定提示】本轮消息显式回复了 id={normalized_reply_id} 的旧消息，但当前没有解析到那张被回复图片。"
+        "不要把最近历史图片当成这次提到的“这张图”；如果信息不足，请直接说明。"
+    )
+    logger.warning(f"被回复图片仍未解析成功 msg_id={normalized_reply_id}，已禁用最近历史图片回退")
+    return [], True, notice
 
 
 async def _build_bound_images(
@@ -562,13 +778,22 @@ async def _build_bound_images(
     state: T_State,
     session_id: str,
     reply_to_message_id: str | None,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], bool, str | None]:
     bound_images: list[dict[str, str]] = []
+    disable_inline_history_images = False
+    binding_notice: str | None = None
     if imgs:
         bound_images.extend(await _build_current_event_bound_images(imgs, event, bot, state))
     if reply_to_message_id:
-        bound_images.extend(await _build_reply_bound_images(db_session, session_id, reply_to_message_id))
-    return bound_images
+        reply_bound_images, disable_inline_history_images, binding_notice = await _build_reply_bound_images(
+            db_session,
+            session_id,
+            reply_to_message_id,
+            event,
+            bot,
+        )
+        bound_images.extend(reply_bound_images)
+    return bound_images, disable_inline_history_images, binding_notice
 
 
 async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
@@ -967,7 +1192,7 @@ async def handle_message(
 
     if should_reply:
         group_id = session.scene.id
-        bound_images = await _build_bound_images(
+        bound_images, disable_inline_history_images, binding_notice = await _build_bound_images(
             db_session,
             imgs,
             event,
@@ -986,6 +1211,8 @@ async def handle_message(
             user_name=user_name,
             is_tome=to_me,
             bound_images=bound_images,
+            disable_inline_history_images=disable_inline_history_images,
+            binding_notice=binding_notice,
         )
         await set_latest_request_id(group_id, request.request_id)
         async with _group_reply_state_lock:
@@ -1132,6 +1359,8 @@ async def handle_reply_logic(
     user_name: str | None,
     is_tome: bool,
     bound_images: list[dict[str, str]] | None = None,
+    disable_inline_history_images: bool = False,
+    binding_notice: str | None = None,
 ):
     """处理回复逻辑"""
     try:
@@ -1225,6 +1454,8 @@ async def handle_reply_logic(
                     role_map,
                     bot_id,
                     bound_images,
+                    disable_inline_history_images,
+                    binding_notice,
                 ),
                 timeout=240.0,
             )
