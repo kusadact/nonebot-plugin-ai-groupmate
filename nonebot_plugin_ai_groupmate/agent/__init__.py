@@ -26,6 +26,7 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_alconna import UniMessage
 from nonebot_plugin_uninfo import SceneType, QryItrface
+from nonebot_plugin_orm import get_session
 from sqlalchemy.orm.session import Session
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain.agents.structured_output import ToolStrategy
@@ -183,7 +184,6 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
 
 
 def create_report_tool(
-    db_session,
     session_id: str,
     request_id: str | None,
     user_id: str,
@@ -207,114 +207,110 @@ def create_report_tool(
             logger.info(f"开始生成用户 {user_name} 在群 {session_id} 的年度报告...")
             now = datetime.datetime.now()
             current_year = now.year
-
-            stmt = Select(ChatHistory).where(
-                ChatHistory.user_id == user_id,
-                ChatHistory.session_id == session_id,  # <--- 关键修改：限制群聊范围
-                extract("year", ChatHistory.created_at) == current_year,
-            )
-            all_msgs = (await db_session.execute(stmt)).scalars().all()
-
-            if not all_msgs:
-                await UniMessage.text("你今年在这个群好像没怎么说话，生成不了报告哦...").send()
-                return "用户本群无数据。"
-
-            # 统计与采样
-            text_msgs = [m.content for m in all_msgs if m.content_type == "text" and m.content]
-            total_count = len(all_msgs)
-
-            # 采样 30 条让 LLM 分析 (只分析在这个群说的话)
-            samples = random.sample(text_msgs, min(len(text_msgs), 30)) if text_msgs else []
-            longest_msg = max(text_msgs, key=len) if text_msgs else "无"
-            if len(longest_msg) > 60:
-                longest_msg = longest_msg[:60] + "..."
-
-            # 活跃时间
-            active_hour_desc = "潜水员"
-            if all_msgs:
-                hours = [m.created_at.hour for m in all_msgs]
-                top_hour = collections.Counter(hours).most_common(1)[0][0]
-                active_hour_desc = f"{top_hour}点"
-
-            async def get_rank_str(content_type=None, hour_limit=None):
-                # 1. 第一步：只根据 user_id 进行分组统计
-                # 注意：Select 里先不要查 user_name，因为我们还没有聚合它
-                stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label("c")).where(extract("year", ChatHistory.created_at) == current_year, ChatHistory.session_id == session_id)
-
-                if content_type:
-                    stmt = stmt.where(ChatHistory.content_type == content_type)
-                if hour_limit:
-                    stmt = stmt.where(extract("hour", ChatHistory.created_at) < hour_limit)
-
-                # 核心修改：只 group_by user_id
-                stmt = stmt.group_by(ChatHistory.user_id).order_by(desc("c")).limit(3)
-
-                # 获取结果，此时是 List[(user_id, count)]
-                rows = (await db_session.execute(stmt)).all()
-
-                if not rows:
-                    return "虚位以待"
-
-                # 2. 第二步：获取这些卷王的“最新昵称”
-                # 因为只取前3名，这里循环查3次数据库完全没问题，且能保证昵称是最新的
-                rank_items = []
-                for uid, count in rows:
-                    # 查询该用户最近的一条消息记录，取当时的名字
-                    name_stmt = Select(ChatHistory.user_name).where(ChatHistory.user_id == uid).order_by(desc(ChatHistory.created_at)).limit(1)
-
-                    latest_name = (await db_session.execute(name_stmt)).scalar()
-
-                    # 兜底：如果查不到名字（极少情况），用 ID 代替
-                    display_name = latest_name if latest_name else f"用户{uid}"
-                    rank_items.append(f"{display_name}({count})")
-                return ", ".join(rank_items)
-
-            rank_talk = await get_rank_str()
-            rank_img = await get_rank_str(content_type="image")
-            rank_night = await get_rank_str(hour_limit=5)
-
-            # 只分析本群的文本
-            stmt_text = (
-                Select(ChatHistory.content)
-                .where(
-                    ChatHistory.session_id == session_id,  # <--- 关键修改
-                    extract("year", ChatHistory.created_at) == current_year,
+            async with get_session() as db_session:
+                stmt = Select(ChatHistory).where(
                     ChatHistory.user_id == user_id,
-                    ChatHistory.content_type == "text",
+                    ChatHistory.session_id == session_id,  # <--- 关键修改：限制群聊范围
+                    extract("year", ChatHistory.created_at) == current_year,
                 )
-                .order_by(desc(ChatHistory.created_at))
-                .limit(2000)
-            )  # 取本群最近2000条
+                all_msgs = (await db_session.execute(stmt)).scalars().all()
 
-            rows = (await db_session.execute(stmt_text)).all()
-            sample_text = "\n".join([r[0] for r in rows if r[0]])
+                if not all_msgs:
+                    await UniMessage.text("你今年在这个群好像没怎么说话，生成不了报告哦...").send()
+                    return "用户本群无数据。"
 
-            clean_text = re.sub(r"[^\u4e00-\u9fa5]", "", sample_text)
-            words = jieba.lcut(clean_text)
-            filtered = [w for w in words if len(w) > 1 and w not in stop_words]
-            hot_words_str = "、".join([x[0] for x in collections.Counter(filtered).most_common(8)])
+                # 统计与采样
+                text_msgs = [m.content for m in all_msgs if m.content_type == "text" and m.content]
+                total_count = len(all_msgs)
 
-            relation_stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
-            relation = (await db_session.execute(relation_stmt)).scalar_one_or_none()
+                # 采样 30 条让 LLM 分析 (只分析在这个群说的话)
+                samples = random.sample(text_msgs, min(len(text_msgs), 30)) if text_msgs else []
+                longest_msg = max(text_msgs, key=len) if text_msgs else "无"
+                if len(longest_msg) > 60:
+                    longest_msg = longest_msg[:60] + "..."
 
-            favorability = 0
-            favorability_raw = 0
-            relation_state = "normal"
-            relation_state_desc = "陌生/普通"
-            impression_tags = []
-            if relation:
-                favorability = relation.favorability
-                favorability_raw = relation.favorability_raw
-                relation_state = relation.state or "normal"
-                relation_state_desc = relation.get_status_desc()
-                impression_tags = relation.tags if relation.tags else []
+                # 活跃时间
+                active_hour_desc = "潜水员"
+                if all_msgs:
+                    hours = [m.created_at.hour for m in all_msgs]
+                    top_hour = collections.Counter(hours).most_common(1)[0][0]
+                    active_hour_desc = f"{top_hour}点"
 
-            # 格式化关系描述，喂给 LLM
-            relation_desc = (
-                f"关系状态: {relation_state} ({relation_state_desc}), "
-                f"分值(映射分/原始分): {favorability}/{favorability_raw}, "
-                f"印象标签: {', '.join(impression_tags)}"
-            )
+                async def get_rank_str(content_type=None, hour_limit=None):
+                    stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label("c")).where(
+                        extract("year", ChatHistory.created_at) == current_year,
+                        ChatHistory.session_id == session_id,
+                    )
+
+                    if content_type:
+                        stmt = stmt.where(ChatHistory.content_type == content_type)
+                    if hour_limit:
+                        stmt = stmt.where(extract("hour", ChatHistory.created_at) < hour_limit)
+
+                    stmt = stmt.group_by(ChatHistory.user_id).order_by(desc("c")).limit(3)
+                    rows = (await db_session.execute(stmt)).all()
+
+                    if not rows:
+                        return "虚位以待"
+
+                    rank_items = []
+                    for uid, count in rows:
+                        name_stmt = (
+                            Select(ChatHistory.user_name)
+                            .where(ChatHistory.user_id == uid)
+                            .order_by(desc(ChatHistory.created_at))
+                            .limit(1)
+                        )
+
+                        latest_name = (await db_session.execute(name_stmt)).scalar()
+                        display_name = latest_name if latest_name else f"用户{uid}"
+                        rank_items.append(f"{display_name}({count})")
+                    return ", ".join(rank_items)
+
+                rank_talk = await get_rank_str()
+                rank_img = await get_rank_str(content_type="image")
+                rank_night = await get_rank_str(hour_limit=5)
+
+                stmt_text = (
+                    Select(ChatHistory.content)
+                    .where(
+                        ChatHistory.session_id == session_id,
+                        extract("year", ChatHistory.created_at) == current_year,
+                        ChatHistory.user_id == user_id,
+                        ChatHistory.content_type == "text",
+                    )
+                    .order_by(desc(ChatHistory.created_at))
+                    .limit(2000)
+                )
+
+                rows = (await db_session.execute(stmt_text)).all()
+                sample_text = "\n".join([r[0] for r in rows if r[0]])
+
+                clean_text = re.sub(r"[^\u4e00-\u9fa5]", "", sample_text)
+                words = jieba.lcut(clean_text)
+                filtered = [w for w in words if len(w) > 1 and w not in stop_words]
+                hot_words_str = "、".join([x[0] for x in collections.Counter(filtered).most_common(8)])
+
+                relation_stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+                relation = (await db_session.execute(relation_stmt)).scalar_one_or_none()
+
+                favorability = 0
+                favorability_raw = 0
+                relation_state = "normal"
+                relation_state_desc = "陌生/普通"
+                impression_tags = []
+                if relation:
+                    favorability = relation.favorability
+                    favorability_raw = relation.favorability_raw
+                    relation_state = relation.state or "normal"
+                    relation_state_desc = relation.get_status_desc()
+                    impression_tags = relation.tags if relation.tags else []
+
+                relation_desc = (
+                    f"关系状态: {relation_state} ({relation_state_desc}), "
+                    f"分值(映射分/原始分): {favorability}/{favorability_raw}, "
+                    f"印象标签: {', '.join(impression_tags)}"
+                )
 
 
             # 构造一个专门写报告的 Prompt
@@ -419,7 +415,6 @@ def create_report_tool(
 
 
 def create_similar_meme_tool(
-    db_session,
     session_id: str,
     request_id: str | None,
     user_id: str | None,
@@ -449,68 +444,69 @@ def create_similar_meme_tool(
         logger.info(f"正在搜索相似图片... target_msg_id={normalized_msg_id or 'latest'}")
 
         try:
-            base_stmt = (
-                Select(ChatHistory)
-                .where(
-                    ChatHistory.session_id == session_id,
-                    ChatHistory.content_type == "image",
-                )
-                .order_by(desc(ChatHistory.created_at))
-            )
-            if normalized_msg_id:
-                stmt = base_stmt.where(ChatHistory.content.contains(f"id: {normalized_msg_id}\n")).limit(1)
-                msg = (await db_session.execute(stmt)).scalar_one_or_none()
-                if msg is None:
-                    stmt = base_stmt.where(ChatHistory.content.contains(f"id:{normalized_msg_id}\n")).limit(1)
-                    msg = (await db_session.execute(stmt)).scalar_one_or_none()
-            elif user_id:
-                stmt = base_stmt.where(ChatHistory.user_id == user_id).limit(1)
-                msg = (await db_session.execute(stmt)).scalar_one_or_none()
-            else:
-                msg = (await db_session.execute(base_stmt.limit(1))).scalar_one_or_none()
-
-            if not msg:
-                return "未找到对应图片消息。"
-
-            if msg.media_id is None:
-                return "目标消息没有关联图片，无法进行相似搜索。"
-
-            media_obj = (
-                await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == msg.media_id))
-            ).scalar_one_or_none()
-            if not media_obj or not media_obj.file_path:
-                return "无法找到原图文件，无法进行分析。"
-
-            pic_ids = await DB.search_media_by_pic([str(pic_dir / media_obj.file_path)])
-            if not pic_ids:
-                logger.info(f"未找到相似图片, source_id: {msg.media_id}")
-                return "没有搜索到相似图片"
-
-            images_info = []
-            rows = (
-                await db_session.execute(
-                    Select(MediaStorage).where(
-                        MediaStorage.media_id.in_(pic_ids),
-                        MediaStorage.blocked.is_(False),
+            async with get_session() as db_session:
+                base_stmt = (
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session_id,
+                        ChatHistory.content_type == "image",
                     )
+                    .order_by(desc(ChatHistory.created_at))
                 )
-            ).scalars().all()
-            media_map = {media.media_id: media for media in rows}
+                if normalized_msg_id:
+                    stmt = base_stmt.where(ChatHistory.content.contains(f"id: {normalized_msg_id}\n")).limit(1)
+                    msg = (await db_session.execute(stmt)).scalar_one_or_none()
+                    if msg is None:
+                        stmt = base_stmt.where(ChatHistory.content.contains(f"id:{normalized_msg_id}\n")).limit(1)
+                        msg = (await db_session.execute(stmt)).scalar_one_or_none()
+                elif user_id:
+                    stmt = base_stmt.where(ChatHistory.user_id == user_id).limit(1)
+                    msg = (await db_session.execute(stmt)).scalar_one_or_none()
+                else:
+                    msg = (await db_session.execute(base_stmt.limit(1))).scalar_one_or_none()
 
-            for pic_id in pic_ids:
-                if pic_id not in media_map:
-                    continue
-                pic = media_map[pic_id]
-                images_info.append(
-                    {
-                        "pic_id": str(pic_id),
-                        "description": pic.description or "未知描述",
-                    }
-                )
+                if not msg:
+                    return "未找到对应图片消息。"
 
-            if not images_info:
-                logger.info(f"相似图检索结果均被黑名单过滤: source_id={msg.media_id}")
-                return "没有搜索到相似图片"
+                if msg.media_id is None:
+                    return "目标消息没有关联图片，无法进行相似搜索。"
+
+                media_obj = (
+                    await db_session.execute(Select(MediaStorage).where(MediaStorage.media_id == msg.media_id))
+                ).scalar_one_or_none()
+                if not media_obj or not media_obj.file_path:
+                    return "无法找到原图文件，无法进行分析。"
+
+                pic_ids = await DB.search_media_by_pic([str(pic_dir / media_obj.file_path)])
+                if not pic_ids:
+                    logger.info(f"未找到相似图片, source_id: {msg.media_id}")
+                    return "没有搜索到相似图片"
+
+                images_info = []
+                rows = (
+                    await db_session.execute(
+                        Select(MediaStorage).where(
+                            MediaStorage.media_id.in_(pic_ids),
+                            MediaStorage.blocked.is_(False),
+                        )
+                    )
+                ).scalars().all()
+                media_map = {media.media_id: media for media in rows}
+
+                for pic_id in pic_ids:
+                    if pic_id not in media_map:
+                        continue
+                    pic = media_map[pic_id]
+                    images_info.append(
+                        {
+                            "pic_id": str(pic_id),
+                            "description": pic.description or "未知描述",
+                        }
+                    )
+
+                if not images_info:
+                    logger.info(f"相似图检索结果均被黑名单过滤: source_id={msg.media_id}")
+                    return "没有搜索到相似图片"
 
             return json.dumps(
                 {
@@ -532,7 +528,6 @@ def create_similar_meme_tool(
 
 
 def create_reply_tool(
-    db_session,
     session_id: str,
     request_id: str | None = None,
     interface: QryItrface | None = None,
@@ -624,21 +619,22 @@ def create_reply_tool(
         return name_to_id
 
     async def _get_latest_bot_message() -> ChatHistory | None:
-        return (
-            (
-                await db_session.execute(
-                    Select(ChatHistory)
-                    .where(
-                        ChatHistory.session_id == session_id,
-                        ChatHistory.content_type == "bot",
+        async with get_session() as db_session:
+            return (
+                (
+                    await db_session.execute(
+                        Select(ChatHistory)
+                        .where(
+                            ChatHistory.session_id == session_id,
+                            ChatHistory.content_type == "bot",
+                        )
+                        .order_by(ChatHistory.msg_id.desc())
+                        .limit(1)
                     )
-                    .order_by(ChatHistory.msg_id.desc())
-                    .limit(1)
                 )
+                .scalars()
+                .first()
             )
-            .scalars()
-            .first()
-        )
 
     async def _is_recent_duplicate(content: str) -> bool:
         latest_bot_msg = await _get_latest_bot_message()
@@ -717,15 +713,16 @@ def create_reply_tool(
 
         res = await message.send()
         msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
-        chat_history = ChatHistory(
-            session_id=session_id,
-            user_id=plugin_config.bot_name,
-            content_type="bot",
-            content=f"id: {msg_id}\n" + content,
-            user_name=plugin_config.bot_name,
-        )
-        db_session.add(chat_history)
-        await db_session.flush()
+        async with get_session() as db_session:
+            chat_history = ChatHistory(
+                session_id=session_id,
+                user_id=plugin_config.bot_name,
+                content_type="bot",
+                content=f"id: {msg_id}\n" + content,
+                user_name=plugin_config.bot_name,
+            )
+            db_session.add(chat_history)
+            await db_session.commit()
         logger.info(f"Bot已回复: {content}")
         return "sent"
 
@@ -774,13 +771,12 @@ def create_reply_tool(
             return "检测到重复回复，已跳过发送。"
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
-            await db_session.rollback()
             return f"发送失败: {e}"
 
     return reply_user
 
 
-def create_search_meme_tool(db_session, session_id: str, request_id: str | None):
+def create_search_meme_tool(session_id: str, request_id: str | None):
     """
     创建一个带数据库会话的表情包搜索工具
 
@@ -812,22 +808,24 @@ def create_search_meme_tool(db_session, session_id: str, request_id: str | None)
                 logger.info(f"未找到匹配的表情包: {description}")
                 return json.dumps({"success": False, "images": []}, ensure_ascii=False)
 
-            # 从数据库获取每张图片的详细信息
             images_info = []
-            for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
-                pic = (
-                    await db_session.execute(
-                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id), MediaStorage.blocked.is_(False))
-                    )
-                ).scalar()
+            async with get_session() as db_session:
+                for pic_id in pic_ids[:5]:
+                    pic = (
+                        await db_session.execute(
+                            Select(MediaStorage).where(
+                                MediaStorage.media_id == int(pic_id), MediaStorage.blocked.is_(False)
+                            )
+                        )
+                    ).scalar()
 
-                if pic:
-                    images_info.append(
-                        {
-                            "pic_id": pic_id,
-                            "description": pic.description,
-                        }
-                    )
+                    if pic:
+                        images_info.append(
+                            {
+                                "pic_id": pic_id,
+                                "description": pic.description,
+                            }
+                        )
 
             if not images_info:
                 return json.dumps(
@@ -856,7 +854,7 @@ def create_search_meme_tool(db_session, session_id: str, request_id: str | None)
     return search_meme_image
 
 
-def create_send_meme_tool(db_session, session_id: str, request_id: str | None = None):
+def create_send_meme_tool(session_id: str, request_id: str | None = None):
     """
     创建一个带上下文的表情包发送工具
 
@@ -889,51 +887,48 @@ def create_send_meme_tool(db_session, session_id: str, request_id: str | None = 
                 return f"发送表情包失败: 无法从 pic_id 中提取有效数字: {pic_id!r}"
             selected_pic_id = int(match.group())
             logger.info(f"使用指定的图片ID: {selected_pic_id}")
+            async with get_session() as db_session:
+                pic = (
+                    await db_session.execute(
+                        Select(MediaStorage).where(MediaStorage.media_id == selected_pic_id)
+                    )
+                ).scalar()
 
-            # 从数据库获取图片信息
-            pic = (
-                await db_session.execute(
-                    Select(MediaStorage).where(MediaStorage.media_id == selected_pic_id)
+                if not pic:
+                    logger.warning(f"图片记录不存在: {selected_pic_id}")
+                    return "图片记录不存在"
+                if pic.blocked:
+                    logger.info(f"图片已被拉黑，拒绝发送: {selected_pic_id}")
+                    return "该表情包已被拉黑，禁止发送"
+
+                pic_path = pic_dir / pic.file_path
+
+                if not pic_path.exists():
+                    logger.warning(f"图片文件不存在: {pic_path}")
+                    return "图片文件不存在"
+
+                pic_data = pic_path.read_bytes()
+                description = pic.description
+
+                if request_id is not None and not await is_request_active(session_id, request_id):
+                    return "请求已过期，已取消发送。"
+
+                res = await UniMessage.image(raw=pic_data).send()
+                chat_history = ChatHistory(
+                    session_id=session_id,
+                    user_id=plugin_config.bot_name,
+                    content_type="bot",
+                    content=f"id: {res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
+                    user_name=plugin_config.bot_name,
+                    media_id=selected_pic_id,
                 )
-            ).scalar()
-
-            if not pic:
-                logger.warning(f"图片记录不存在: {selected_pic_id}")
-                return "图片记录不存在"
-            if pic.blocked:
-                logger.info(f"图片已被拉黑，拒绝发送: {selected_pic_id}")
-                return "该表情包已被拉黑，禁止发送"
-
-            pic_path = pic_dir / pic.file_path
-
-            if not pic_path.exists():
-                logger.warning(f"图片文件不存在: {pic_path}")
-                return "图片文件不存在"
-
-            # 读取图片数据
-            pic_data = pic_path.read_bytes()
-            description = pic.description
-
-            if request_id is not None and not await is_request_active(session_id, request_id):
-                return "请求已过期，已取消发送。"
-
-            # 发送图片
-            res = await UniMessage.image(raw=pic_data).send()
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=plugin_config.bot_name,
-                content_type="bot",
-                content=f"id: {res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
-                user_name=plugin_config.bot_name,
-                media_id=selected_pic_id,
-            )
-            db_session.add(chat_history)
-            logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
-            return f"已成功发送表情包: {description}"
+                db_session.add(chat_history)
+                await db_session.commit()
+                logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
+                return f"已成功发送表情包: {description}"
 
         except Exception as e:
             logger.error(f"发送表情包失败: {e}")
-            await db_session.rollback()
             return f"发送表情包失败: {str(e)}"
 
     return send_meme_image
@@ -1089,7 +1084,6 @@ def create_mute_tool(
 
 
 def create_relation_tool(
-    db_session,
     session_id: str,
     request_id: str | None,
     user_id: str,
@@ -1117,82 +1111,73 @@ def create_relation_tool(
             return "请求已过期，已取消更新。"
 
         try:
-            # 1. 查询或初始化记录
-            stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
-            result = await db_session.execute(stmt)
-            relation = result.scalar_one_or_none()
+            async with get_session() as db_session:
+                stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+                result = await db_session.execute(stmt)
+                relation = result.scalar_one_or_none()
 
-            if not relation:
-                relation = UserRelation(
-                    user_id=user_id,
-                    user_name=user_name or "",
-                    favorability=0,
-                    favorability_raw=0,
-                    state="normal",
-                    tags=[],
-                    last_interact_at=datetime.datetime.now(),
+                if not relation:
+                    relation = UserRelation(
+                        user_id=user_id,
+                        user_name=user_name or "",
+                        favorability=0,
+                        favorability_raw=0,
+                        state="normal",
+                        tags=[],
+                        last_interact_at=datetime.datetime.now(),
+                    )
+                    db_session.add(relation)
+
+                old_score = relation.favorability
+                transition = apply_favorability_change_detailed(
+                    old_score=old_score,
+                    old_raw=relation.favorability_raw,
+                    requested_change=score_change,
+                    reason=reason,
+                    now=datetime.datetime.now(),
+                    daily_gain_used=relation.daily_gain_used,
+                    daily_loss_used=relation.daily_loss_used,
+                    daily_bypass_used=relation.daily_bypass_used,
+                    daily_gain_bank=relation.daily_gain_bank,
+                    daily_cap=relation.daily_cap,
+                    cap_reset_at=relation.cap_reset_at,
+                    apology_counts=relation.apology_counts,
+                    last_penalty_at=relation.last_penalty_at,
                 )
-                db_session.add(relation)
+                relation.favorability = transition.new_score
+                relation.favorability_raw = transition.new_raw
+                relation.state = transition.state_after
+                relation.daily_gain_used = transition.daily_gain_used_after
+                relation.daily_loss_used = transition.daily_loss_used_after
+                relation.daily_bypass_used = transition.daily_bypass_used_after
+                relation.daily_gain_bank = transition.daily_gain_bank_after
+                relation.daily_cap = transition.daily_cap_after
+                relation.cap_reset_at = transition.cap_reset_at_after
+                relation.apology_counts = transition.apology_counts_after
+                relation.last_interact_at = transition.last_interact_at
+                if transition.applied_change_raw < 0:
+                    relation.last_penalty_at = transition.last_interact_at
 
-            # 2. 处理好感度
-            old_score = relation.favorability
-            transition = apply_favorability_change_detailed(
-                old_score=old_score,
-                old_raw=relation.favorability_raw,
-                requested_change=score_change,
-                reason=reason,
-                now=datetime.datetime.now(),
-                daily_gain_used=relation.daily_gain_used,
-                daily_loss_used=relation.daily_loss_used,
-                daily_bypass_used=relation.daily_bypass_used,
-                daily_gain_bank=relation.daily_gain_bank,
-                daily_cap=relation.daily_cap,
-                cap_reset_at=relation.cap_reset_at,
-                apology_counts=relation.apology_counts,
-                last_penalty_at=relation.last_penalty_at,
-            )
-            relation.favorability = transition.new_score
-            relation.favorability_raw = transition.new_raw
-            relation.state = transition.state_after
-            relation.daily_gain_used = transition.daily_gain_used_after
-            relation.daily_loss_used = transition.daily_loss_used_after
-            relation.daily_bypass_used = transition.daily_bypass_used_after
-            relation.daily_gain_bank = transition.daily_gain_bank_after
-            relation.daily_cap = transition.daily_cap_after
-            relation.cap_reset_at = transition.cap_reset_at_after
-            relation.apology_counts = transition.apology_counts_after
-            relation.last_interact_at = transition.last_interact_at
-            if transition.applied_change_raw < 0:
-                relation.last_penalty_at = transition.last_interact_at
-            # 3. 处理标签 (核心修改)
-            # 获取现有标签的副本
-            current_tags = list(relation.tags) if relation.tags else []
+                current_tags = list(relation.tags) if relation.tags else []
+                if remove_tags:
+                    current_tags = [tag for tag in current_tags if tag not in remove_tags]
+                if add_tags:
+                    for tag in add_tags:
+                        if tag not in current_tags:
+                            current_tags.append(tag)
+                if len(current_tags) > 8:
+                    current_tags = current_tags[-8:]
 
-            # 执行移除操作 (处理 modify 的前半部分)
-            if remove_tags:
-                current_tags = [tag for tag in current_tags if tag not in remove_tags]
+                relation.tags = current_tags
+                relation.user_name = user_name or ""
+                favorability = transition.new_score
+                favorability_raw = transition.new_raw
 
-            # 执行新增操作
-            if add_tags:
-                for tag in add_tags:
-                    if tag not in current_tags:
-                        current_tags.append(tag)
+                if request_id is not None and not await is_request_active(session_id, request_id):
+                    await db_session.rollback()
+                    return "请求已过期，已取消更新。"
 
-            # 限制标签总数，防止Token爆炸 (例如最多保留 8 个，保留最新的)
-            if len(current_tags) > 8:
-                current_tags = current_tags[-8:]
-
-            # 赋值回数据库对象
-            relation.tags = current_tags
-            relation.user_name = user_name or ""  # 同步更新昵称
-            favorability = transition.new_score
-            favorability_raw = transition.new_raw
-
-            if request_id is not None and not await is_request_active(session_id, request_id):
-                await db_session.rollback()
-                return "请求已过期，已取消更新。"
-
-            await db_session.commit()
+                await db_session.commit()
 
             # 构建反馈信息
             tag_msg = ""
@@ -1453,7 +1438,7 @@ async def create_chat_agent(
 【风格】
 - 像真实群友，口语化、简短自然
 - 优先短句；默认只调用一次 `reply_user`
-- 如果确实需要连续发 2-3 条短消息，请在同一次 `reply_user` 的 content 中用换行分隔，每行一个重点
+- 遇到简单的问题，优先只发送一条短消息进行回复；如果遇到了复杂的问题，可以把一个复杂的问题拆成连续发 2-3 条短消息，如果你这么做，请在同一次 `reply_user` 的 content 中用换行分隔，每行一个重点
 - 不要为了拆句多次调用 `reply_user`
 - 多条回复必须信息递进，后一条必须提供新信息，禁止同义改写重复
 - 如果下一条和上一条语义高度重叠，直接不发下一条
@@ -1484,29 +1469,11 @@ async def create_chat_agent(
 - 在 `search_history_context` 中禁止相对时间词：昨天、前天、本周、上周、这个月、上个月、最近等
 - 使用明确日期时间或关键词检索
 """
-    report_tool = create_report_tool(
-        db_session,
-        session_id,
-        request_id,
-        user_id,
-        user_name,
-        model,
-    )
-    search_meme_tool = create_search_meme_tool(db_session, session_id, request_id)
-    send_meme_tool = create_send_meme_tool(db_session, session_id, request_id)
-    relation_tool = create_relation_tool(
-        db_session,
-        session_id,
-        request_id,
-        user_id,
-        user_name,
-    )
-    similar_meme_tool = create_similar_meme_tool(
-        db_session,
-        session_id,
-        request_id,
-        user_id,
-    )
+    report_tool = create_report_tool(session_id, request_id, user_id, user_name, model)
+    search_meme_tool = create_search_meme_tool(session_id, request_id)
+    send_meme_tool = create_send_meme_tool(session_id, request_id)
+    relation_tool = create_relation_tool(session_id, request_id, user_id, user_name)
+    similar_meme_tool = create_similar_meme_tool(session_id, request_id, user_id)
     mute_tool = create_mute_tool(
         session_id,
         request_id,
@@ -1520,7 +1487,7 @@ async def create_chat_agent(
         tools = [
             search_web,
             search_history_context,
-            create_reply_tool(db_session, session_id, request_id, interface),
+            create_reply_tool(session_id, request_id, interface),
             search_meme_tool,
             similar_meme_tool,
             send_meme_tool,
@@ -1534,7 +1501,7 @@ async def create_chat_agent(
         tools = [
             search_web,
             search_history_context,
-            create_reply_tool(db_session, session_id, request_id, interface),
+            create_reply_tool(session_id, request_id, interface),
             search_meme_tool,
             similar_meme_tool,
             send_meme_tool,
@@ -1714,6 +1681,7 @@ async def choice_response_strategy(
     history: list[ChatHistorySchema],
     user_id: str,
     user_name: str | None,
+    is_tome: bool = False,
     setting: str | None = None,
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
@@ -1747,15 +1715,39 @@ async def choice_response_strategy(
             binding_notice=binding_notice,
         )
 
+        latest_user_msg = next((msg for msg in reversed(history) if msg.content_type != "bot"), None)
+        focus_notice = ""
+        if latest_user_msg is not None:
+            focus_id, focus_reply_id, focus_body = _parse_msg_meta(latest_user_msg.content)
+            focus_body = focus_body or ("[图片]" if latest_user_msg.content_type == "image" else "")
+            focus_lines = [
+                "【当前触发消息】",
+                f"发送者: {latest_user_msg.user_name}",
+                f"消息类型: {'图片' if latest_user_msg.content_type == 'image' else '文本'}",
+                f"消息id: {focus_id or '未知'}",
+            ]
+            if focus_reply_id:
+                focus_lines.append(f"回复目标id: {focus_reply_id}")
+            if focus_body:
+                focus_lines.append(f"正文: {focus_body}")
+            focus_lines.append("这条消息是你本轮主要响应对象，历史消息只作为背景参考。")
+            if is_tome or user_id:
+                focus_lines.append("这是一次直接触发你的对话。默认只回应这条消息的发送者，不要替其他人接话。")
+            else:
+                focus_lines.append("如果你决定回复，默认只接这条最新消息，不要顺带延续其他人的支线。")
+            focus_notice = "\n".join(focus_lines)
+
         today = datetime.datetime.now()
         weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
         prompt_text = f"""
 【当前环境】
 时间: {today.strftime("%Y-%m-%d %H:%M:%S")} {weekdays[today.weekday()]}
 {f"额外设置: {setting}" if setting else ""}
+{focus_notice}
 
 【任务】
 请根据上述对话历史，判断是否需要回复。如果需要，请调用相应工具。
+如果需要回复，默认只回应当前触发消息的发送者；除非当前消息明确要求，否则不要替其他人答话。
 如果是针对图片的消息，请结合图片内容回答。
 如果上文包含“【当前重点图片】”，优先围绕这些图片回答。
 如果不需要回复，请保持沉默。

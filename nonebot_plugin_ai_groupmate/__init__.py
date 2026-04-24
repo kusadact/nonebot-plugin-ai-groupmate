@@ -1449,6 +1449,7 @@ async def handle_reply_logic(
                     last_msg,
                     user_id,
                     user_name,
+                    is_tome,
                     plugin_config.personality_setting,
                     interface,
                     role_map,
