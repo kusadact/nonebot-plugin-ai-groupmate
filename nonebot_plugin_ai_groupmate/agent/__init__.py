@@ -748,26 +748,40 @@ def create_reply_tool(
             name_to_id = await _build_name_to_id_map()
             sent_count = 0
             duplicate_count = 0
+            sent_segments: list[str] = []
+            duplicate_segments: list[str] = []
 
             for index, segment in enumerate(segments):
                 result = await _send_reply_segment(segment, name_to_id)
                 if result == "expired":
                     if sent_count > 0:
-                        return f"请求已过期，已发送 {sent_count} 条。"
+                        sent_detail = "\n".join(f"{i}. {text}" for i, text in enumerate(sent_segments, 1))
+                        return f"请求已过期，已发送 {sent_count} 条。\n实际发送内容：\n{sent_detail}"
                     return "请求已过期，已取消发送。"
                 if result == "duplicate":
                     duplicate_count += 1
+                    duplicate_segments.append(segment)
                     continue
 
                 sent_count += 1
+                sent_segments.append(segment)
                 if index < len(segments) - 1:
                     await asyncio.sleep(0.35)
 
             if sent_count > 0:
+                sent_detail = "\n".join(f"{i}. {text}" for i, text in enumerate(sent_segments, 1))
+                detail = f"实际发送内容：\n{sent_detail}"
                 if duplicate_count > 0:
-                    return f"回复已成功发送，共 {sent_count} 条，跳过重复内容 {duplicate_count} 条。"
-                return f"回复已成功发送，共 {sent_count} 条。"
+                    duplicate_detail = "\n".join(
+                        f"{i}. {text}" for i, text in enumerate(duplicate_segments, 1)
+                    )
+                    detail += f"\n跳过的重复内容：\n{duplicate_detail}"
+                    return f"回复已成功发送，共 {sent_count} 条，跳过重复内容 {duplicate_count} 条。\n{detail}"
+                return f"回复已成功发送，共 {sent_count} 条。\n{detail}"
 
+            if duplicate_segments:
+                duplicate_detail = "\n".join(f"{i}. {text}" for i, text in enumerate(duplicate_segments, 1))
+                return f"检测到重复回复，已跳过发送。\n跳过的重复内容：\n{duplicate_detail}"
             return "检测到重复回复，已跳过发送。"
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
