@@ -169,6 +169,8 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__qdrant_api_key` | 否 | 空 | Qdrant API Key |
 | `ai_groupmate__chat_vector_dim` | 否 | `1024` | 聊天文本向量维度 |
 | `ai_groupmate__media_vector_dim` | 否 | `2560` | 图片向量维度 |
+| `ai_groupmate__media_search_recall_limit` | 否 | `6` | 表情包检索从 Qdrant 召回的候选数；DashScope `qwen3-vl-rerank` 图片批量限制为 1-6，默认保持 6 |
+| `ai_groupmate__media_search_return_limit` | 否 | `5` | 表情包检索最终返回给 Agent 的候选数 |
 | `ai_groupmate__remote_embedding_base_url` | 否 | 空 | 文本 embedding 服务地址，OpenAI 风格 |
 | `ai_groupmate__remote_embedding_api_key` | 否 | 空 | 文本 embedding API Key |
 | `ai_groupmate__remote_embedding_model` | 否 | 空 | 文本 embedding 模型名 |
@@ -234,6 +236,8 @@ ai_groupmate__qdrant_uri=http://127.0.0.1:6333
 ai_groupmate__qdrant_api_key=
 ai_groupmate__chat_vector_dim=1024
 ai_groupmate__media_vector_dim=2560
+ai_groupmate__media_search_recall_limit=6
+ai_groupmate__media_search_return_limit=5
 
 ai_groupmate__openai_base_url=https://dashscope.aliyuncs.com/compatible-mode/v1
 ai_groupmate__openai_model=qwen3.5-plus
@@ -262,6 +266,11 @@ ai_groupmate__remote_media_rerank_base_url=
 ai_groupmate__remote_media_rerank_api_key=
 ai_groupmate__remote_media_rerank_model=
 ```
+
+说明：
+
+- `media_search_recall_limit` 控制送入图片 rerank 的候选池大小。使用阿里 DashScope `qwen3-vl-rerank` 时不要超过 `6`，否则接口会返回 `image batch size can should be [1, 6]`。
+- `media_search_return_limit` 控制工具最终给 Agent 看的候选数量，默认 `5` 保持原有行为。
 
 ## 🧭 使用
 

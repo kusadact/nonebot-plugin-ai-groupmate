@@ -9,6 +9,8 @@ class ScopedConfig(BaseModel):
     qdrant_api_key: str = ""
     chat_vector_dim: int = 1024
     media_vector_dim: int = 2560
+    media_search_recall_limit: int = 6
+    media_search_return_limit: int = 5
     # embedding 分路（硅基流动/OpenAI 风格接口）
     remote_embedding_base_url: str = ""
     remote_embedding_api_key: str = ""
