@@ -1563,9 +1563,9 @@ async def create_chat_agent(
     if ToolCallLimitMiddleware is not None:
         try:
             middleware = [
-                ToolCallLimitMiddleware(run_limit=8),
+                ToolCallLimitMiddleware(run_limit=20),
                 ToolCallLimitMiddleware(tool_name="reply_user", run_limit=1),
-                ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=1),
+                ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=5),
             ]
         except Exception as e:
             logger.warning(f"当前 LangChain middleware 参数不兼容，跳过工具限流: {e}")
