@@ -1002,6 +1002,34 @@ def create_mute_tool(
         }
         return {alias for alias in aliases if alias}
 
+    def _member_display_name(member: Any, fallback: str) -> str:
+        return (
+            str(getattr(member, "nick", "") or "").strip()
+            or str(getattr(member, "name", "") or "").strip()
+            or str(getattr(getattr(member, "user", None), "nick", "") or "").strip()
+            or str(getattr(getattr(member, "user", None), "name", "") or "").strip()
+            or fallback
+        )
+
+    async def _record_mute_action(action: str, target_name: str, target_id: str, reason: str) -> None:
+        try:
+            async with get_session() as db_session:
+                chat_history = ChatHistory(
+                    session_id=session_id,
+                    user_id=plugin_config.bot_name,
+                    content_type="bot",
+                    content=(
+                        "id: system\n"
+                        f"系统记录：已执行群管理操作，{action}用户“{target_name}”"
+                        f"（user_id: {target_id}）。原因：{reason}"
+                    ),
+                    user_name=plugin_config.bot_name,
+                )
+                db_session.add(chat_history)
+                await db_session.commit()
+        except Exception as e:
+            logger.warning(f"记录禁言操作到聊天历史失败: {e}")
+
     @tool("mute_user")
     async def mute_user(target_user_name: str, duration_seconds: int, reason: str) -> str:
         """
@@ -1084,10 +1112,14 @@ def create_mute_tool(
                 return "当前适配器不支持禁言功能。"
 
             action = "解除禁言" if duration_seconds == 0 else f"禁言 {duration_seconds} 秒"
-            display_name = current_user_name if normalized_target in {"我", "我自己", "自己", "me", "self"} else target_user_name
+            display_name = _member_display_name(
+                target_member,
+                current_user_name if normalized_target in {"我", "我自己", "自己", "me", "self"} else target_user_name,
+            )
             logger.info(
                 f"已{action}用户 name={display_name!r} user_id={target_member.id} session_id={session_id} reason={reason}"
             )
+            await _record_mute_action(action, display_name, str(target_member.id), reason)
             return f"已成功{action}用户“{display_name}”。原因：{reason}"
         except Exception as e:
             logger.error(f"禁言工具执行失败: {e}")
