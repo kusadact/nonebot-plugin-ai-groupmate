@@ -400,6 +400,21 @@ def _event_at_bot(event: Event, bot: Bot) -> bool:
     return False
 
 
+def _extract_reply_id_from_text(text: str) -> str | None:
+    patterns = (
+        r"\[reply:id=([^\],]+)[^\]]*\]",
+        r"\[CQ:reply,(?:[^\]]*,)?id=([^,\]]+)",
+        r"\breply:id=([^,\]\s]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            reply_id = match.group(1).strip()
+            if reply_id:
+                return reply_id
+    return None
+
+
 def _extract_reply_message_id_from_event(event: Event) -> str | None:
     def _pick_reply_id(obj: Any) -> str | None:
         if obj is None:
@@ -431,15 +446,15 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
 
             # OneBot v11 常见字符串形态：[reply:id=123456]
             text = str(raw_msg)
-            m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", text)
-            if m:
-                return m.group(1)
+            rid = _extract_reply_id_from_text(text)
+            if rid:
+                return rid
 
         # Last fallback: parse serialized event text.
         event_text = str(event)
-        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", event_text)
-        if m:
-            return m.group(1)
+        rid = _extract_reply_id_from_text(event_text)
+        if rid:
+            return rid
     except Exception:
         return None
     return None
@@ -666,8 +681,14 @@ async def _build_reply_bound_images_from_api(
             return bound_images
 
     try:
+        api_message_id = int(normalized_reply_id)
+    except ValueError:
+        logger.info(f"跳过 get_msg API 回溯，reply id 非数字 msg_id={normalized_reply_id}")
+        return []
+
+    try:
         payload = await asyncio.wait_for(
-            bot.call_api("get_msg", message_id=int(normalized_reply_id)),
+            bot.call_api("get_msg", message_id=api_message_id),
             timeout=10.0,
         )
     except Exception as e:
@@ -716,6 +737,7 @@ async def _build_reply_bound_images(
     reply_to_message_id: str | None,
     event: Event,
     bot: Bot,
+    max_images: int = 3,
 ) -> tuple[list[dict[str, str]], bool, str | None]:
     if not reply_to_message_id:
         return [], False, None
@@ -730,35 +752,57 @@ async def _build_reply_bound_images(
             ChatHistory.session_id == session_id,
             ChatHistory.content_type == "image",
         )
-        .order_by(desc(ChatHistory.created_at))
+        .order_by(ChatHistory.msg_id.asc())
     )
-    stmt = base_stmt.where(ChatHistory.content.contains(f"id: {normalized_reply_id}\n")).limit(1)
-    msg = (await db_session.execute(stmt)).scalar_one_or_none()
-    if msg is None:
-        stmt = base_stmt.where(ChatHistory.content.contains(f"id:{normalized_reply_id}\n")).limit(1)
-        msg = (await db_session.execute(stmt)).scalar_one_or_none()
+    replied_messages: list[ChatHistory] = []
+    seen_msg_ids: set[int] = set()
+    for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
+        stmt = base_stmt.where(ChatHistory.content.contains(marker)).limit(max_images)
+        rows = (await db_session.execute(stmt)).scalars().all()
+        for msg in rows:
+            msg_id = int(msg.msg_id)
+            if msg_id in seen_msg_ids:
+                continue
+            seen_msg_ids.add(msg_id)
+            replied_messages.append(msg)
+            if len(replied_messages) >= max_images:
+                break
+        if len(replied_messages) >= max_images:
+            break
 
-    if msg is not None and msg.media_id is not None:
+    replied_messages.sort(key=lambda item: item.msg_id)
+
+    bound_images: list[dict[str, str]] = []
+    media_ids: list[int] = []
+    for msg in replied_messages:
+        if msg.media_id is None:
+            continue
         media_obj = await db_session.get(MediaStorage, msg.media_id)
-        if media_obj is not None and media_obj.file_path:
-            file_path = pic_dir / media_obj.file_path
-            if file_path.exists():
-                try:
-                    image_url = _image_to_data_uri(file_path)
-                    bound_image = {
-                        "label": "被回复图片",
-                        "image_url": image_url,
-                    }
-                    note = _extract_content_body(msg.content)
-                    if note and note != "[图片]":
-                        bound_image["note"] = note[:80]
-                    logger.info(f"命中本地被回复图片绑定 msg_id={normalized_reply_id} media_id={msg.media_id}")
-                    return [bound_image], False, None
-                except Exception as e:
-                    logger.warning(f"读取本地被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+        if media_obj is None or not media_obj.file_path:
+            continue
+        file_path = pic_dir / media_obj.file_path
+        if not file_path.exists():
+            continue
+        try:
+            image_url = _image_to_data_uri(file_path)
+            bound_image = {
+                "label": "被回复图片" if not bound_images else f"被回复图片{len(bound_images) + 1}",
+                "image_url": image_url,
+            }
+            note = _extract_content_body(msg.content)
+            if note and note != "[图片]":
+                bound_image["note"] = note[:80]
+            bound_images.append(bound_image)
+            media_ids.append(int(msg.media_id))
+        except Exception as e:
+            logger.warning(f"读取本地被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+
+    if bound_images:
+        logger.info(f"命中本地被回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)} media_ids={media_ids}")
+        return bound_images, False, None
 
     logger.info(f"本地未命中被回复图片，尝试 API 解析 msg_id={normalized_reply_id}")
-    api_bound_images = await _build_reply_bound_images_from_api(event, bot, normalized_reply_id)
+    api_bound_images = await _build_reply_bound_images_from_api(event, bot, normalized_reply_id, max_images=max_images)
     if api_bound_images:
         return api_bound_images, False, None
 
@@ -1101,9 +1145,7 @@ async def handle_message(
     if not reply_to_message_id:
         reply_to_message_id = _extract_reply_message_id_from_event(event)
     if not reply_to_message_id:
-        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", str(msg))
-        if m:
-            reply_to_message_id = m.group(1)
+        reply_to_message_id = _extract_reply_id_from_text(str(msg))
 
     if reply_to_message_id:
         content += f"回复id: {reply_to_message_id}\n"
