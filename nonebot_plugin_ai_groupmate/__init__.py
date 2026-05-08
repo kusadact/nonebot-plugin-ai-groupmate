@@ -115,6 +115,7 @@ class ReplyRequest:
     user_id: str
     user_name: str | None
     is_tome: bool
+    bound_messages: list[dict[str, str]]
     bound_images: list[dict[str, str]]
     disable_inline_history_images: bool
     binding_notice: str | None
@@ -160,6 +161,7 @@ async def _run_group_reply_worker(group_id: str) -> None:
                     request.user_id,
                     request.user_name,
                     request.is_tome,
+                    request.bound_messages,
                     request.bound_images,
                     request.disable_inline_history_images,
                     request.binding_notice,
@@ -606,26 +608,73 @@ async def _resolve_reply_image_source(
     return None, None
 
 
-async def _build_reply_bound_images_from_payload(
+def _payload_sender_name(payload: Any) -> str:
+    sender = getattr(payload, "sender", None)
+    if sender is None and isinstance(payload, dict):
+        sender = payload.get("sender")
+    if isinstance(sender, dict):
+        return str(sender.get("card") or sender.get("nickname") or sender.get("user_id") or "").strip()
+    if sender is not None:
+        return str(
+            getattr(sender, "card", None)
+            or getattr(sender, "nickname", None)
+            or getattr(sender, "user_id", None)
+            or ""
+        ).strip()
+    return ""
+
+
+def _build_bound_message(
+    label: str,
+    user_name: str,
+    content_type: str,
+    text: str,
+    msg_id: str | int | None = None,
+) -> dict[str, str]:
+    item = {
+        "label": label,
+        "user_name": user_name,
+        "content_type": content_type,
+        "text": text,
+    }
+    if msg_id is not None:
+        item["msg_id"] = str(msg_id)
+    return item
+
+
+async def _build_reply_binding_from_payload(
     bot: Bot,
     payload: Any,
     reply_to_message_id: str,
-    max_images: int = 3,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
     message_obj = getattr(payload, "message", None)
     if message_obj is None and isinstance(payload, dict):
         message_obj = payload.get("message")
     if message_obj is None:
-        return []
+        return [], [], False
 
     note = _extract_text_from_message_obj(message_obj)
+    bound_messages: list[dict[str, str]] = []
+    if note:
+        bound_messages.append(
+            _build_bound_message(
+                "被回复消息",
+                _payload_sender_name(payload),
+                "text",
+                note,
+                reply_to_message_id,
+            )
+        )
+
     bound_images: list[dict[str, str]] = []
+    saw_image = False
 
     for seg in _iter_message_segments(message_obj):
         seg_type, seg_data = _segment_type_and_data(seg)
         if seg_type != "image":
             continue
 
+        saw_image = True
         source_kind, source_value = await _resolve_reply_image_source(bot, seg_data)
         if not source_kind or not source_value:
             continue
@@ -657,34 +706,34 @@ async def _build_reply_bound_images_from_payload(
         if note:
             bound_image["note"] = note[:80]
         bound_images.append(bound_image)
-        if len(bound_images) >= max_images:
-            break
 
-    return bound_images
+    return bound_messages, bound_images, saw_image
 
 
-async def _build_reply_bound_images_from_api(
+async def _build_reply_binding_from_api(
     event: Event,
     bot: Bot,
     reply_to_message_id: str,
-    max_images: int = 3,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
     normalized_reply_id = str(reply_to_message_id).strip()
     if not normalized_reply_id:
-        return []
+        return [], [], False
 
     payload = _extract_reply_payload_from_event(event, normalized_reply_id)
     if payload is not None:
-        bound_images = await _build_reply_bound_images_from_payload(bot, payload, normalized_reply_id, max_images=max_images)
-        if bound_images:
-            logger.info(f"命中事件回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)}")
-            return bound_images
+        bound_messages, bound_images, saw_image = await _build_reply_binding_from_payload(bot, payload, normalized_reply_id)
+        if bound_messages or bound_images:
+            logger.info(
+                f"命中事件回复消息绑定 msg_id={normalized_reply_id} "
+                f"messages={len(bound_messages)} images={len(bound_images)}"
+            )
+            return bound_messages, bound_images, saw_image
 
     try:
         api_message_id = int(normalized_reply_id)
     except ValueError:
         logger.info(f"跳过 get_msg API 回溯，reply id 非数字 msg_id={normalized_reply_id}")
-        return []
+        return [], [], False
 
     try:
         payload = await asyncio.wait_for(
@@ -693,12 +742,15 @@ async def _build_reply_bound_images_from_api(
         )
     except Exception as e:
         logger.warning(f"获取被回复消息失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
-        return []
+        return [], [], False
 
-    bound_images = await _build_reply_bound_images_from_payload(bot, payload, normalized_reply_id, max_images=max_images)
-    if bound_images:
-        logger.info(f"命中 API 回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)}")
-    return bound_images
+    bound_messages, bound_images, saw_image = await _build_reply_binding_from_payload(bot, payload, normalized_reply_id)
+    if bound_messages or bound_images:
+        logger.info(
+            f"命中 API 回复消息绑定 msg_id={normalized_reply_id} "
+            f"messages={len(bound_messages)} images={len(bound_images)}"
+        )
+    return bound_messages, bound_images, saw_image
 
 
 async def _build_current_event_bound_images(
@@ -706,11 +758,10 @@ async def _build_current_event_bound_images(
     event: Event,
     bot: Bot,
     state: T_State,
-    max_images: int = 3,
 ) -> list[dict[str, str]]:
     bound_images: list[dict[str, str]] = []
 
-    for idx, img in enumerate(imgs[:max_images]):
+    for idx, img in enumerate(imgs):
         image_format = _guess_image_format(getattr(img, "id", None))
         try:
             image_bytes = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
@@ -731,50 +782,68 @@ async def _build_current_event_bound_images(
     return bound_images
 
 
-async def _build_reply_bound_images(
+async def _build_reply_binding(
     db_session,
     session_id: str,
     reply_to_message_id: str | None,
     event: Event,
     bot: Bot,
-    max_images: int = 3,
-) -> tuple[list[dict[str, str]], bool, str | None]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool, str | None]:
     if not reply_to_message_id:
-        return [], False, None
+        return [], [], False, None
 
     normalized_reply_id = str(reply_to_message_id).strip()
     if not normalized_reply_id:
-        return [], False, None
+        return [], [], False, None
 
     base_stmt = (
         Select(ChatHistory)
         .where(
             ChatHistory.session_id == session_id,
-            ChatHistory.content_type == "image",
         )
         .order_by(ChatHistory.msg_id.asc())
     )
     replied_messages: list[ChatHistory] = []
     seen_msg_ids: set[int] = set()
     for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
-        stmt = base_stmt.where(ChatHistory.content.contains(marker)).limit(max_images)
+        stmt = base_stmt.where(ChatHistory.content.contains(marker))
         rows = (await db_session.execute(stmt)).scalars().all()
         for msg in rows:
+            content_lines = msg.content.splitlines()
+            if not content_lines or not content_lines[0].startswith("id:"):
+                continue
+            own_id = content_lines[0].split(":", 1)[1].strip()
+            if own_id != normalized_reply_id:
+                continue
             msg_id = int(msg.msg_id)
             if msg_id in seen_msg_ids:
                 continue
             seen_msg_ids.add(msg_id)
             replied_messages.append(msg)
-            if len(replied_messages) >= max_images:
-                break
-        if len(replied_messages) >= max_images:
-            break
 
     replied_messages.sort(key=lambda item: item.msg_id)
 
+    bound_messages: list[dict[str, str]] = []
     bound_images: list[dict[str, str]] = []
     media_ids: list[int] = []
+    image_rows = 0
     for msg in replied_messages:
+        body = _extract_content_body(msg.content)
+        if msg.content_type == "text" or msg.content_type == "bot":
+            if body:
+                bound_messages.append(
+                    _build_bound_message("被回复消息", msg.user_name, msg.content_type, body, msg.msg_id)
+                )
+            continue
+
+        if msg.content_type != "image":
+            continue
+
+        image_rows += 1
+        image_text = body if body and body != "[图片]" else "[图片]"
+        bound_messages.append(
+            _build_bound_message("被回复图片消息", msg.user_name, "image", image_text, msg.msg_id)
+        )
         if msg.media_id is None:
             continue
         media_obj = await db_session.get(MediaStorage, msg.media_id)
@@ -797,24 +866,47 @@ async def _build_reply_bound_images(
         except Exception as e:
             logger.warning(f"读取本地被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
 
-    if bound_images:
-        logger.info(f"命中本地被回复图片绑定 msg_id={normalized_reply_id} count={len(bound_images)} media_ids={media_ids}")
-        return bound_images, False, None
+    if bound_messages or bound_images:
+        logger.info(
+            f"命中本地被回复消息绑定 msg_id={normalized_reply_id} "
+            f"messages={len(bound_messages)} images={len(bound_images)} media_ids={media_ids}"
+        )
+        if image_rows > 0 and not bound_images:
+            logger.warning(f"被回复消息含图片但本地图片无法加载 msg_id={normalized_reply_id}，尝试 API 解析")
+        else:
+            return bound_messages, bound_images, False, None
 
-    logger.info(f"本地未命中被回复图片，尝试 API 解析 msg_id={normalized_reply_id}")
-    api_bound_images = await _build_reply_bound_images_from_api(event, bot, normalized_reply_id, max_images=max_images)
-    if api_bound_images:
-        return api_bound_images, False, None
+    logger.info(f"本地未完整命中被回复消息，尝试 API 解析 msg_id={normalized_reply_id}")
+    api_bound_messages, api_bound_images, api_saw_image = await _build_reply_binding_from_api(event, bot, normalized_reply_id)
+    if api_bound_messages or api_bound_images:
+        if api_saw_image and not api_bound_images:
+            notice = (
+                f"【回复绑定提示】本轮消息回复了 id={normalized_reply_id} 的旧消息，"
+                "已解析到被回复消息文字，但其中图片没有加载成功。不要把最近历史图片当成这次回复指向的图片；"
+                "如果需要图片内容，请直接说明图片未加载。"
+            )
+            return api_bound_messages, api_bound_images, True, notice
+        return api_bound_messages, api_bound_images, False, None
+
+    if bound_messages and image_rows > 0 and not bound_images:
+        notice = (
+            f"【回复绑定提示】本轮消息回复了 id={normalized_reply_id} 的旧消息，"
+            "已命中被回复消息记录，但其中图片没有加载成功。不要把最近历史图片当成这次回复指向的图片；"
+            "如果需要图片内容，请直接说明图片未加载。"
+        )
+        return bound_messages, bound_images, True, notice
 
     notice = (
-        f"【图片绑定提示】本轮消息显式回复了 id={normalized_reply_id} 的旧消息，但当前没有解析到那张被回复图片。"
-        "不要把最近历史图片当成这次提到的“这张图”；如果信息不足，请直接说明。"
+        f"【回复绑定提示】本轮消息显式回复了 id={normalized_reply_id} 的旧消息，"
+        "但当前没有解析到被回复消息内容。不要把最近历史消息或图片当成这次回复指向的对象；"
+        "如果信息不足，请直接说明。"
     )
-    logger.warning(f"被回复图片仍未解析成功 msg_id={normalized_reply_id}，已禁用最近历史图片回退")
-    return [], True, notice
+    should_disable_inline_images = image_rows > 0 or api_saw_image or not bound_messages
+    logger.warning(f"被回复消息仍未解析成功 msg_id={normalized_reply_id} disable_inline_images={should_disable_inline_images}")
+    return bound_messages, bound_images, should_disable_inline_images, notice
 
 
-async def _build_bound_images(
+async def _build_bound_context(
     db_session,
     imgs: list[Image],
     event: Event,
@@ -822,22 +914,24 @@ async def _build_bound_images(
     state: T_State,
     session_id: str,
     reply_to_message_id: str | None,
-) -> tuple[list[dict[str, str]], bool, str | None]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool, str | None]:
+    bound_messages: list[dict[str, str]] = []
     bound_images: list[dict[str, str]] = []
     disable_inline_history_images = False
     binding_notice: str | None = None
     if imgs:
         bound_images.extend(await _build_current_event_bound_images(imgs, event, bot, state))
     if reply_to_message_id:
-        reply_bound_images, disable_inline_history_images, binding_notice = await _build_reply_bound_images(
+        reply_bound_messages, reply_bound_images, disable_inline_history_images, binding_notice = await _build_reply_binding(
             db_session,
             session_id,
             reply_to_message_id,
             event,
             bot,
         )
+        bound_messages.extend(reply_bound_messages)
         bound_images.extend(reply_bound_images)
-    return bound_images, disable_inline_history_images, binding_notice
+    return bound_messages, bound_images, disable_inline_history_images, binding_notice
 
 
 async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
@@ -1234,7 +1328,7 @@ async def handle_message(
 
     if should_reply:
         group_id = session.scene.id
-        bound_images, disable_inline_history_images, binding_notice = await _build_bound_images(
+        bound_messages, bound_images, disable_inline_history_images, binding_notice = await _build_bound_context(
             db_session,
             imgs,
             event,
@@ -1252,6 +1346,7 @@ async def handle_message(
             user_id=user_id,
             user_name=user_name,
             is_tome=to_me,
+            bound_messages=bound_messages,
             bound_images=bound_images,
             disable_inline_history_images=disable_inline_history_images,
             binding_notice=binding_notice,
@@ -1400,6 +1495,7 @@ async def handle_reply_logic(
     user_id: str,
     user_name: str | None,
     is_tome: bool,
+    bound_messages: list[dict[str, str]] | None = None,
     bound_images: list[dict[str, str]] | None = None,
     disable_inline_history_images: bool = False,
     binding_notice: str | None = None,
@@ -1496,6 +1592,7 @@ async def handle_reply_logic(
                     interface,
                     role_map,
                     bot_id,
+                    bound_messages,
                     bound_images,
                     disable_inline_history_images,
                     binding_notice,

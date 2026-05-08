@@ -1593,6 +1593,7 @@ async def format_chat_history(
     history: list[ChatHistorySchema],
     max_inline_images: int = 3,
     user_roles: dict[str, str] | None = None,
+    bound_messages: list[dict[str, str]] | None = None,
     bound_images: list[dict[str, str]] | None = None,
     disable_inline_history_images: bool = False,
     binding_notice: str | None = None,
@@ -1600,6 +1601,7 @@ async def format_chat_history(
     """将最近图片以内联多模态格式喂给主模型，旧图片退化为文本。"""
     messages: list[BaseMessage] = []
     user_roles = user_roles or {}
+    bound_messages = bound_messages or []
     bound_images = bound_images or []
 
     def _role_prefix(uid: str) -> str:
@@ -1693,6 +1695,18 @@ async def format_chat_history(
     if binding_notice:
         messages.append(HumanMessage(content=binding_notice))
 
+    if bound_messages:
+        lines = ["【本轮回复引用的消息】当前用户回复了以下历史消息，回答时优先结合这些引用内容："]
+        for idx, item in enumerate(bound_messages, 1):
+            user_name = (item.get("user_name") or "未知用户").strip()
+            content_type = (item.get("content_type") or "text").strip()
+            msg_id = (item.get("msg_id") or "").strip()
+            text = (item.get("text") or "").strip()
+            type_label = "图片消息" if content_type == "image" else "文本消息"
+            id_suffix = f" msg_id={msg_id}" if msg_id else ""
+            lines.append(f"{idx}. [{type_label}{id_suffix}] {user_name}: {text}")
+        messages.append(HumanMessage(content="\n".join(lines)))
+
     if bound_images:
         parts: list[dict[str, Any]] = [
             {
@@ -1732,6 +1746,7 @@ async def choice_response_strategy(
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
+    bound_messages: list[dict[str, str]] | None = None,
     bound_images: list[dict[str, str]] | None = None,
     disable_inline_history_images: bool = False,
     binding_notice: str | None = None,
@@ -1756,6 +1771,7 @@ async def choice_response_strategy(
             db_session,
             history,
             user_roles=role_map,
+            bound_messages=bound_messages,
             bound_images=bound_images,
             disable_inline_history_images=disable_inline_history_images,
             binding_notice=binding_notice,
@@ -1795,6 +1811,7 @@ async def choice_response_strategy(
 请根据上述对话历史，判断是否需要回复。如果需要，请调用相应工具。
 如果需要回复，默认只回应当前触发消息的发送者；除非当前消息明确要求，否则不要替其他人答话。
 如果是针对图片的消息，请结合图片内容回答。
+如果上文包含“【本轮回复引用的消息】”，优先结合这些被回复的文本或图片消息回答。
 如果上文包含“【当前重点图片】”，优先围绕这些图片回答。
 如果不需要回复，请保持沉默。
 """
