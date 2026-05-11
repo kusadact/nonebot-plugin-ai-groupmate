@@ -8,6 +8,7 @@ authors = [
     { name = "kusadact", email = "959472968@qq.com" },
 ]
 dependencies = [
+    "httpx>=0.28.1",
     "jieba>=0.42.1",
     "langchain>=1.1.0",
     "langchain-core>=1.1.0",

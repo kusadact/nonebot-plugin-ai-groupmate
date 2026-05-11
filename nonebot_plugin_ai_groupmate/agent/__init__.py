@@ -41,6 +41,7 @@ from ..config import Config
 from ..favorability import apply_favorability_change_detailed
 from ..memory import DB
 from ..reply_guard import is_request_active
+from .voice_tool import create_voice_tool, is_voice_service_healthy
 
 require("nonebot_plugin_localstore")
 
@@ -1446,6 +1447,7 @@ async def create_chat_agent(
     group_context = await get_group_context(db_session, session_id)
     recent_relations_context = await get_recent_relations_context(db_session, history or [])
     has_admin_permission = False
+    voice_tool_available = await is_voice_service_healthy(plugin_config)
     if interface is not None and bot_id:
         try:
             members = await interface.get_members(SceneType.GROUP, session_id)
@@ -1460,6 +1462,13 @@ async def create_chat_agent(
 
     permission_status = ""
     mute_tool_instruction = ""
+    voice_tool_instruction = ""
+    if voice_tool_available:
+        voice_tool_instruction = """- 语音：可使用 `send_voice` 合成并发送语音
+  - 只有用户明确要求“发语音 / 用语音说 / 念出来 / 读出来”时才使用
+  - 语音内容必须短，优先一句话，避免长段落
+  - 如果 `send_voice` 返回失败，不要假装已发送；可以改用 `reply_user` 简短说明
+"""
     if has_admin_permission:
         permission_status = """
 【你的权限】
@@ -1508,6 +1517,7 @@ async def create_chat_agent(
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到“年度报告 / 个人总结 / 成分分析”，直接调用 `generate_and_send_annual_report`；
   工具完成后只回复“请查收~”，不要复述报告
+{voice_tool_instruction}
 {mute_tool_instruction}
 - 回复结束后调用 `finish`
 
@@ -1526,6 +1536,11 @@ async def create_chat_agent(
     send_meme_tool = create_send_meme_tool(session_id, request_id)
     relation_tool = create_relation_tool(session_id, request_id, user_id, user_name)
     similar_meme_tool = create_similar_meme_tool(session_id, request_id, user_id)
+    voice_tool = (
+        create_voice_tool(session_id, request_id, plugin_config, plugin_config.bot_name)
+        if voice_tool_available
+        else None
+    )
     mute_tool = create_mute_tool(
         session_id,
         request_id,
@@ -1547,6 +1562,8 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        if voice_tool is not None:
+            tools.insert(-1, voice_tool)
         if has_admin_permission:
             tools.insert(-1, mute_tool)
     else:
@@ -1562,6 +1579,8 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        if voice_tool is not None:
+            tools.insert(-1, voice_tool)
         if has_admin_permission:
             tools.insert(-1, mute_tool)
 
@@ -1573,6 +1592,8 @@ async def create_chat_agent(
                 ToolCallLimitMiddleware(tool_name="reply_user", run_limit=1),
                 ToolCallLimitMiddleware(tool_name="send_meme_image", run_limit=1),
             ]
+            if voice_tool_available:
+                middleware.append(ToolCallLimitMiddleware(tool_name="send_voice", run_limit=1))
         except Exception as e:
             logger.warning(f"当前 LangChain middleware 参数不兼容，跳过工具限流: {e}")
             middleware = None

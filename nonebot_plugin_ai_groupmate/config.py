@@ -43,6 +43,33 @@ class ScopedConfig(BaseModel):
     openai_base_url: str = ""
     openai_model: str = ""
     openai_token: str = ""
+    voice_enabled: bool = False
+    voice_base_url: str = ""
+    voice_tts_path: str = "/tts"
+    voice_health_path: str = "/"
+    voice_health_timeout_seconds: float = 2.0
+    voice_tts_timeout_seconds: float = 180.0
+    voice_health_cache_seconds: float = 30.0
+    voice_unhealthy_cache_seconds: float = 10.0
+    voice_ref_audio_path: str = "ref_audio/Azuma/Azuma_10.wav"
+    voice_prompt_text: str = "完了我找不到他之前的投稿了，反正就是有一个。"
+    voice_text_lang: str = "zh"
+    voice_prompt_lang: str = "zh"
+    voice_text_split_method: str = "cut5"
+    voice_request_media_type: str = "wav"
+    voice_output_format: str = "amr"
+    voice_streaming_mode: int = 0
+    voice_batch_size: int = 1
+    voice_speed_factor: float = 1.0
+    voice_top_k: int = 15
+    voice_top_p: float = 1.0
+    voice_temperature: float = 1.0
+    voice_max_text_length: int = 120
+    voice_ffmpeg_path: str = "ffmpeg"
+    voice_ffmpeg_timeout_seconds: float = 30.0
+    voice_ffmpeg_audio_codec: str = "libopencore_amrnb"
+    voice_amr_sample_rate: int = 8000
+    voice_amr_bitrate: str = "12.2k"
 
 
 class Config(BaseModel):
