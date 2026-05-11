@@ -51,6 +51,7 @@ class ScopedConfig(BaseModel):
     voice_tts_timeout_seconds: float = 180.0
     voice_health_cache_seconds: float = 30.0
     voice_unhealthy_cache_seconds: float = 10.0
+    voice_trust_env_proxy: bool = False
     voice_ref_audio_path: str = "ref_audio/Azuma/Azuma_10.wav"
     voice_prompt_text: str = "完了我找不到他之前的投稿了，反正就是有一个。"
     voice_text_lang: str = "zh"

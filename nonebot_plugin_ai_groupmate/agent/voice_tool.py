@@ -159,7 +159,11 @@ async def is_voice_service_healthy(config: ScopedConfig, *, force: bool = False)
         old_result = _health_result
         try:
             timeout = httpx.Timeout(max(float(config.voice_health_timeout_seconds or 0), 0.1))
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                trust_env=bool(config.voice_trust_env_proxy),
+            ) as client:
                 response = await client.get(url)
             healthy = response.status_code < 500
             detail = f"HTTP {response.status_code}"
@@ -208,7 +212,7 @@ async def _request_tts_audio(config: ScopedConfig, text: str) -> bytes:
     timeout = httpx.Timeout(max(float(config.voice_tts_timeout_seconds or 0), 1.0))
 
     async with _tts_lock:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=bool(config.voice_trust_env_proxy)) as client:
             response = await client.post(url, json=payload)
 
     if response.status_code != 200:

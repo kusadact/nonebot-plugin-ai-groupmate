@@ -212,6 +212,7 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_tts_timeout_seconds` | 否 | `180.0` | TTS 请求超时 |
 | `ai_groupmate__voice_health_cache_seconds` | 否 | `30.0` | 健康状态缓存时间 |
 | `ai_groupmate__voice_unhealthy_cache_seconds` | 否 | `10.0` | 不健康状态缓存时间 |
+| `ai_groupmate__voice_trust_env_proxy` | 否 | `false` | 语音请求是否使用容器环境代理；frp/直连地址建议保持 `false` |
 | `ai_groupmate__voice_ref_audio_path` | 否 | `ref_audio/Azuma/Azuma_10.wav` | GPT-SoVITS 参考音频路径，按服务端可访问路径填写 |
 | `ai_groupmate__voice_prompt_text` | 否 | `完了我找不到他之前的投稿了，反正就是有一个。` | 参考音频对应文本 |
 | `ai_groupmate__voice_text_lang` | 否 | `zh` | 目标文本语言 |
@@ -269,6 +270,7 @@ ai_groupmate__voice_enabled=true
 ai_groupmate__voice_base_url=http://127.0.0.1:9880
 ai_groupmate__voice_tts_path=/tts
 ai_groupmate__voice_health_path=/
+ai_groupmate__voice_trust_env_proxy=false
 
 ai_groupmate__voice_ref_audio_path=ref_audio/Azuma/Azuma_10.wav
 ai_groupmate__voice_prompt_text=完了我找不到他之前的投稿了，反正就是有一个。
