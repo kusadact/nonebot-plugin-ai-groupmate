@@ -10,6 +10,8 @@ from pathlib import Path
 
 import httpx
 from langchain.tools import tool
+from nonebot import get_bot
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.log import logger
 from nonebot_plugin_alconna import UniMessage
 from nonebot_plugin_orm import get_session
@@ -346,7 +348,16 @@ async def _cleanup_voice_file_later(path: Path, delay_seconds: float) -> None:
         path.unlink()
 
 
-async def _send_voice_audio(audio: bytes, output_format: str, config: ScopedConfig):
+def _extract_message_id(result) -> str:
+    if hasattr(result, "msg_ids"):
+        msg_ids = getattr(result, "msg_ids", None) or []
+        return str(msg_ids[-1]["message_id"]) if msg_ids else "unknown"
+    if isinstance(result, dict):
+        return str(result.get("message_id") or result.get("message_id_v2") or "unknown")
+    return "unknown"
+
+
+async def _send_voice_audio(audio: bytes, output_format: str, config: ScopedConfig, session_id: str):
     method = _normalize_voice_send_method(config.voice_send_method)
     if method == "raw":
         mimetype = _audio_mimetype(output_format)
@@ -357,7 +368,14 @@ async def _send_voice_audio(audio: bytes, output_format: str, config: ScopedConf
 
     path = _write_voice_file(audio, output_format, config)
     try:
-        return await UniMessage.voice(path=path).send()
+        try:
+            group_id = int(session_id)
+        except ValueError as e:
+            raise VoiceToolError(f"path 发送方式只支持数字群号 session_id: {session_id}") from e
+        logger.info(f"准备发送语音文件: {path} size={path.stat().st_size} format={output_format}")
+        bot = get_bot()
+        message = Message(MessageSegment.record(path.as_posix()))
+        return await bot.call_api("send_msg", message_type="group", group_id=group_id, message=message)
     finally:
         keep_seconds = max(float(config.voice_send_file_keep_seconds or 0), 0.0)
         if keep_seconds > 0:
@@ -419,8 +437,8 @@ def create_voice_tool(
             if not await _is_current_request_active(session_id, request_id):
                 return "请求已过期，已取消发送语音。"
 
-            result = await _send_voice_audio(audio, output_format, config)
-            msg_id = result.msg_ids[-1]["message_id"] if result.msg_ids else "unknown"
+            result = await _send_voice_audio(audio, output_format, config, session_id)
+            msg_id = _extract_message_id(result)
             async with get_session() as db_session:
                 chat_history = ChatHistory(
                     session_id=session_id,

@@ -285,11 +285,11 @@ ai_groupmate__voice_request_media_type=wav
 ai_groupmate__voice_output_format=wav
 ai_groupmate__voice_ffmpeg_path=ffmpeg
 ai_groupmate__voice_volume_gain=1.5
-# 如果 NoneBot 和 NapCat 共享同一个目录，可以用 path 发送，避免 base64 语音缺少扩展名。
+# 如果 NoneBot 和 NapCat 共享同一个目录，可以用 path 发送；OneBot 会收到普通绝对路径。
 # ai_groupmate__voice_send_method=path
 # ai_groupmate__voice_send_dir=/app/.config/QQ/NapCat/temp
 # 如需更稳的响度处理，可用 loudnorm 替代简单音量放大。
-# ai_groupmate__voice_ffmpeg_audio_filter=loudnorm=I=-10:TP=-1.5:LRA=7,aresample=32000
+# ai_groupmate__voice_ffmpeg_audio_filter=loudnorm=I=-10:TP=-1.5:LRA=7,aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono
 ```
 
 ### 当前 fork 推荐配置
