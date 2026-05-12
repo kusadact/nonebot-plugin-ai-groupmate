@@ -372,9 +372,10 @@ async def _send_voice_audio(audio: bytes, output_format: str, config: ScopedConf
             group_id = int(session_id)
         except ValueError as e:
             raise VoiceToolError(f"path 发送方式只支持数字群号 session_id: {session_id}") from e
-        logger.info(f"准备发送语音文件: {path} size={path.stat().st_size} format={output_format}")
+        record_file = path.as_uri()
+        logger.info(f"准备发送语音文件: {record_file} size={path.stat().st_size} format={output_format}")
         bot = get_bot()
-        message = Message(MessageSegment.record(path.as_posix()))
+        message = Message(MessageSegment.record(record_file))
         return await bot.call_api("send_msg", message_type="group", group_id=group_id, message=message)
     finally:
         keep_seconds = max(float(config.voice_send_file_keep_seconds or 0), 0.0)
