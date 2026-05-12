@@ -229,6 +229,7 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_max_text_length` | 否 | `120` | 单条语音最大文本长度 |
 | `ai_groupmate__voice_ffmpeg_path` | 否 | `ffmpeg` | ffmpeg 可执行文件路径 |
 | `ai_groupmate__voice_ffmpeg_timeout_seconds` | 否 | `30.0` | ffmpeg 转码超时 |
+| `ai_groupmate__voice_ffmpeg_audio_filter` | 否 | 空 | 自定义 ffmpeg 音频滤镜；填写后优先于 `voice_volume_gain`，例如 `loudnorm=I=-10:TP=-1.5:LRA=7,aresample=32000` |
 | `ai_groupmate__voice_ffmpeg_audio_codec` | 否 | `libopencore_amrnb` | 转 AMR 时使用的音频编码器；如本机 ffmpeg 不支持可改配置 |
 | `ai_groupmate__voice_volume_gain` | 否 | `1.5` | 转码时的音量倍率；`1.0` 表示不放大 |
 | `ai_groupmate__voice_amr_sample_rate` | 否 | `8000` | AMR 采样率 |
@@ -281,6 +282,8 @@ ai_groupmate__voice_request_media_type=wav
 ai_groupmate__voice_output_format=wav
 ai_groupmate__voice_ffmpeg_path=ffmpeg
 ai_groupmate__voice_volume_gain=1.5
+# 如需更稳的响度处理，可用 loudnorm 替代简单音量放大。
+# ai_groupmate__voice_ffmpeg_audio_filter=loudnorm=I=-10:TP=-1.5:LRA=7,aresample=32000
 ```
 
 ### 当前 fork 推荐配置

@@ -56,6 +56,10 @@ def _audio_mimetype(audio_format: str) -> str:
 
 
 def _build_ffmpeg_audio_filter(config: ScopedConfig) -> str | None:
+    audio_filter = (config.voice_ffmpeg_audio_filter or "").strip()
+    if audio_filter:
+        return audio_filter
+
     volume_gain = max(float(config.voice_volume_gain or 0), 0.0)
     if volume_gain <= 0 or volume_gain == 1.0:
         return None
