@@ -55,6 +55,13 @@ def _audio_mimetype(audio_format: str) -> str:
     return _MIME_BY_FORMAT.get(_normalize_audio_format(audio_format), f"audio/{_normalize_audio_format(audio_format)}")
 
 
+def _build_ffmpeg_audio_filter(config: ScopedConfig) -> str | None:
+    volume_gain = max(float(config.voice_volume_gain or 0), 0.0)
+    if volume_gain <= 0 or volume_gain == 1.0:
+        return None
+    return f"volume={volume_gain:g}"
+
+
 def _is_voice_configured(config: ScopedConfig) -> bool:
     if not config.voice_enabled:
         return False
@@ -250,6 +257,9 @@ def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, co
 
         if target_format == "amr":
             command.extend(["-ar", str(int(config.voice_amr_sample_rate)), "-ac", "1"])
+            audio_filter = _build_ffmpeg_audio_filter(config)
+            if audio_filter:
+                command.extend(["-af", audio_filter])
             if (config.voice_ffmpeg_audio_codec or "").strip():
                 command.extend(["-c:a", config.voice_ffmpeg_audio_codec.strip()])
             if (config.voice_amr_bitrate or "").strip():

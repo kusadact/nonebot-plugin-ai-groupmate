@@ -69,6 +69,7 @@ class ScopedConfig(BaseModel):
     voice_ffmpeg_path: str = "ffmpeg"
     voice_ffmpeg_timeout_seconds: float = 30.0
     voice_ffmpeg_audio_codec: str = "libopencore_amrnb"
+    voice_volume_gain: float = 1.5
     voice_amr_sample_rate: int = 8000
     voice_amr_bitrate: str = "12.2k"
 

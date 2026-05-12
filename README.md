@@ -230,6 +230,7 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_ffmpeg_path` | 否 | `ffmpeg` | ffmpeg 可执行文件路径 |
 | `ai_groupmate__voice_ffmpeg_timeout_seconds` | 否 | `30.0` | ffmpeg 转码超时 |
 | `ai_groupmate__voice_ffmpeg_audio_codec` | 否 | `libopencore_amrnb` | 转 AMR 时使用的音频编码器；如本机 ffmpeg 不支持可改配置 |
+| `ai_groupmate__voice_volume_gain` | 否 | `1.5` | 转码时的音量倍率；`1.0` 表示不放大 |
 | `ai_groupmate__voice_amr_sample_rate` | 否 | `8000` | AMR 采样率 |
 | `ai_groupmate__voice_amr_bitrate` | 否 | `12.2k` | AMR 码率 |
 | `ai_groupmate__openai_base_url` | 是 | 空 | 主对话模型 base URL，OpenAI 兼容 |
@@ -279,6 +280,7 @@ ai_groupmate__voice_prompt_text=完了我找不到他之前的投稿了，反正
 ai_groupmate__voice_request_media_type=wav
 ai_groupmate__voice_output_format=amr
 ai_groupmate__voice_ffmpeg_path=ffmpeg
+ai_groupmate__voice_volume_gain=1.5
 ```
 
 ### 当前 fork 推荐配置
