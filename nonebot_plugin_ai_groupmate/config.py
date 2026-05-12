@@ -59,6 +59,9 @@ class ScopedConfig(BaseModel):
     voice_text_split_method: str = "cut5"
     voice_request_media_type: str = "wav"
     voice_output_format: str = "wav"
+    voice_send_method: str = "raw"
+    voice_send_dir: str = ""
+    voice_send_file_keep_seconds: float = 300.0
     voice_streaming_mode: int = 0
     voice_batch_size: int = 1
     voice_speed_factor: float = 1.0

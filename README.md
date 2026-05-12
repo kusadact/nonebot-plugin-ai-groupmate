@@ -220,6 +220,9 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_text_split_method` | 否 | `cut5` | GPT-SoVITS 分句方式 |
 | `ai_groupmate__voice_request_media_type` | 否 | `wav` | GPT-SoVITS 返回格式 |
 | `ai_groupmate__voice_output_format` | 否 | `wav` | bot 最终发送格式；NapCat 会自行转码发送语音，通常保持 `wav` 即可 |
+| `ai_groupmate__voice_send_method` | 否 | `raw` | 语音发送方式；`raw` 使用 base64，`path` 使用本地文件路径 |
+| `ai_groupmate__voice_send_dir` | 否 | 空 | `voice_send_method=path` 时的音频临时目录，需确保 OneBot/NapCat 进程可访问 |
+| `ai_groupmate__voice_send_file_keep_seconds` | 否 | `300.0` | `path` 发送后临时音频文件保留秒数 |
 | `ai_groupmate__voice_streaming_mode` | 否 | `0` | GPT-SoVITS 流式模式；机器人发送语音建议 `0` |
 | `ai_groupmate__voice_batch_size` | 否 | `1` | GPT-SoVITS batch size |
 | `ai_groupmate__voice_speed_factor` | 否 | `1.0` | 语速 |
@@ -282,6 +285,9 @@ ai_groupmate__voice_request_media_type=wav
 ai_groupmate__voice_output_format=wav
 ai_groupmate__voice_ffmpeg_path=ffmpeg
 ai_groupmate__voice_volume_gain=1.5
+# 如果 NoneBot 和 NapCat 共享同一个目录，可以用 path 发送，避免 base64 语音缺少扩展名。
+# ai_groupmate__voice_send_method=path
+# ai_groupmate__voice_send_dir=/app/.config/QQ/NapCat/temp
 # 如需更稳的响度处理，可用 loudnorm 替代简单音量放大。
 # ai_groupmate__voice_ffmpeg_audio_filter=loudnorm=I=-10:TP=-1.5:LRA=7,aresample=32000
 ```
