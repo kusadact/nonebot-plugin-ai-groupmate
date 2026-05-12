@@ -1,17 +1,13 @@
 import asyncio
-import contextlib
 import re
 import shutil
 import subprocess
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import httpx
 from langchain.tools import tool
-from nonebot import get_bot
-from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.log import logger
 from nonebot_plugin_alconna import UniMessage
 from nonebot_plugin_orm import get_session
@@ -59,15 +55,7 @@ def _audio_mimetype(audio_format: str) -> str:
     return _MIME_BY_FORMAT.get(_normalize_audio_format(audio_format), f"audio/{_normalize_audio_format(audio_format)}")
 
 
-def _normalize_voice_send_method(value: str) -> str:
-    return (value or "raw").strip().lower()
-
-
-def _build_ffmpeg_audio_filter(config: ScopedConfig) -> str | None:
-    audio_filter = (config.voice_ffmpeg_audio_filter or "").strip()
-    if audio_filter:
-        return audio_filter
-
+def _voice_volume_filter(config: ScopedConfig) -> str | None:
     volume_gain = max(float(config.voice_volume_gain or 0), 0.0)
     if volume_gain <= 0 or volume_gain == 1.0:
         return None
@@ -86,33 +74,11 @@ def _is_voice_configured(config: ScopedConfig) -> bool:
     return True
 
 
-def _send_requirement_detail(config: ScopedConfig) -> str | None:
-    method = _normalize_voice_send_method(config.voice_send_method)
-    if method == "raw":
-        return None
-    if method != "path":
-        return f"不支持的语音发送方式: {config.voice_send_method}"
-
-    send_dir = (config.voice_send_dir or "").strip()
-    if not send_dir:
-        return "voice_send_method=path 时必须配置 voice_send_dir"
-
-    try:
-        directory = Path(send_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        return f"无法创建语音发送目录 {send_dir}: {type(e).__name__}: {e}"
-
-    if not directory.is_dir():
-        return f"语音发送目录不是有效目录: {send_dir}"
-    return None
-
-
 def _conversion_requirement_detail(config: ScopedConfig) -> str | None:
     source_format = _normalize_audio_format(config.voice_request_media_type)
     target_format = _normalize_audio_format(config.voice_output_format)
-    audio_filter = _build_ffmpeg_audio_filter(config)
-    if source_format == target_format and not audio_filter:
+    volume_filter = _voice_volume_filter(config)
+    if source_format == target_format and not volume_filter:
         return None
 
     ffmpeg_path = (config.voice_ffmpeg_path or "ffmpeg").strip() or "ffmpeg"
@@ -165,13 +131,13 @@ async def is_voice_service_healthy(config: ScopedConfig, *, force: bool = False)
 
     cache_key = ((config.voice_base_url or "").strip(), (config.voice_health_path or "").strip())
     now = time.monotonic()
-    requirement_error = _conversion_requirement_detail(config) or _send_requirement_detail(config)
-    if requirement_error:
+    conversion_error = _conversion_requirement_detail(config)
+    if conversion_error:
         ttl = max(float(config.voice_unhealthy_cache_seconds or 0), 0.0)
         cache_is_valid = (
             not force
             and _health_cache_key == cache_key
-            and _health_detail == requirement_error
+            and _health_detail == conversion_error
             and now - _health_checked_at < ttl
         )
         if cache_is_valid:
@@ -179,8 +145,8 @@ async def is_voice_service_healthy(config: ScopedConfig, *, force: bool = False)
         _health_cache_key = cache_key
         _health_checked_at = now
         _health_result = False
-        _health_detail = requirement_error
-        logger.warning(f"语音服务健康检查失败: {requirement_error}")
+        _health_detail = conversion_error
+        logger.warning(f"语音服务健康检查失败: {conversion_error}")
         return False
 
     ttl = config.voice_health_cache_seconds if _health_result else config.voice_unhealthy_cache_seconds
@@ -270,8 +236,8 @@ async def _request_tts_audio(config: ScopedConfig, text: str) -> bytes:
 def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, config: ScopedConfig) -> bytes:
     source_format = _normalize_audio_format(source_format)
     target_format = _normalize_audio_format(target_format)
-    audio_filter = _build_ffmpeg_audio_filter(config)
-    if source_format == target_format and not audio_filter:
+    volume_filter = _voice_volume_filter(config)
+    if source_format == target_format and not volume_filter:
         return audio
 
     ffmpeg_path = (config.voice_ffmpeg_path or "ffmpeg").strip() or "ffmpeg"
@@ -291,8 +257,8 @@ def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, co
             str(source_path),
         ]
 
-        if audio_filter:
-            command.extend(["-af", audio_filter])
+        if volume_filter:
+            command.extend(["-af", volume_filter])
 
         if target_format == "amr":
             command.extend(["-ar", str(int(config.voice_amr_sample_rate)), "-ac", "1"])
@@ -328,62 +294,6 @@ def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, co
 
 async def _convert_audio(audio: bytes, source_format: str, target_format: str, config: ScopedConfig) -> bytes:
     return await asyncio.to_thread(_convert_audio_sync, audio, source_format, target_format, config)
-
-
-def _write_voice_file(audio: bytes, audio_format: str, config: ScopedConfig) -> Path:
-    send_dir = (config.voice_send_dir or "").strip()
-    if not send_dir:
-        raise VoiceToolError("voice_send_method=path 时必须配置 voice_send_dir")
-
-    directory = Path(send_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"ai_groupmate_voice_{int(time.time())}_{uuid.uuid4().hex}.{audio_format}"
-    path.write_bytes(audio)
-    return path.resolve()
-
-
-async def _cleanup_voice_file_later(path: Path, delay_seconds: float) -> None:
-    await asyncio.sleep(max(delay_seconds, 0.0))
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
-
-
-def _extract_message_id(result) -> str:
-    if hasattr(result, "msg_ids"):
-        msg_ids = getattr(result, "msg_ids", None) or []
-        return str(msg_ids[-1]["message_id"]) if msg_ids else "unknown"
-    if isinstance(result, dict):
-        return str(result.get("message_id") or result.get("message_id_v2") or "unknown")
-    return "unknown"
-
-
-async def _send_voice_audio(audio: bytes, output_format: str, config: ScopedConfig, session_id: str):
-    method = _normalize_voice_send_method(config.voice_send_method)
-    if method == "raw":
-        mimetype = _audio_mimetype(output_format)
-        return await UniMessage.voice(raw=audio, mimetype=mimetype, name=f"voice.{output_format}").send()
-
-    if method != "path":
-        raise VoiceToolError(f"不支持的语音发送方式: {config.voice_send_method}")
-
-    path = _write_voice_file(audio, output_format, config)
-    try:
-        try:
-            group_id = int(session_id)
-        except ValueError as e:
-            raise VoiceToolError(f"path 发送方式只支持数字群号 session_id: {session_id}") from e
-        record_file = path.as_uri()
-        logger.info(f"准备发送语音文件: {record_file} size={path.stat().st_size} format={output_format}")
-        bot = get_bot()
-        message = Message(MessageSegment.record(record_file))
-        return await bot.call_api("send_msg", message_type="group", group_id=group_id, message=message)
-    finally:
-        keep_seconds = max(float(config.voice_send_file_keep_seconds or 0), 0.0)
-        if keep_seconds > 0:
-            asyncio.create_task(_cleanup_voice_file_later(path, keep_seconds))
-        else:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
 
 
 def _normalize_voice_text(text: str, max_length: int) -> str:
@@ -434,12 +344,13 @@ def create_voice_tool(
 
             output_format = _normalize_audio_format(config.voice_output_format)
             audio = await _convert_audio(audio, config.voice_request_media_type, output_format, config)
+            mimetype = _audio_mimetype(output_format)
 
             if not await _is_current_request_active(session_id, request_id):
                 return "请求已过期，已取消发送语音。"
 
-            result = await _send_voice_audio(audio, output_format, config, session_id)
-            msg_id = _extract_message_id(result)
+            result = await UniMessage.voice(raw=audio, mimetype=mimetype, name=f"voice.{output_format}").send()
+            msg_id = result.msg_ids[-1]["message_id"] if result.msg_ids else "unknown"
             async with get_session() as db_session:
                 chat_history = ChatHistory(
                     session_id=session_id,

@@ -219,10 +219,7 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_prompt_lang` | 否 | `zh` | 参考音频语言 |
 | `ai_groupmate__voice_text_split_method` | 否 | `cut5` | GPT-SoVITS 分句方式 |
 | `ai_groupmate__voice_request_media_type` | 否 | `wav` | GPT-SoVITS 返回格式 |
-| `ai_groupmate__voice_output_format` | 否 | `wav` | bot 最终发送格式；NapCat 会自行转码发送语音，通常保持 `wav` 即可 |
-| `ai_groupmate__voice_send_method` | 否 | `raw` | 语音发送方式；`raw` 使用 base64，`path` 使用本地文件路径 |
-| `ai_groupmate__voice_send_dir` | 否 | 空 | `voice_send_method=path` 时的音频临时目录，需确保 OneBot/NapCat 进程可访问 |
-| `ai_groupmate__voice_send_file_keep_seconds` | 否 | `300.0` | `path` 发送后临时音频文件保留秒数 |
+| `ai_groupmate__voice_output_format` | 否 | `wav` | bot 最终发送格式；NapCat 会自行处理语音上传，通常保持 `wav` 即可 |
 | `ai_groupmate__voice_streaming_mode` | 否 | `0` | GPT-SoVITS 流式模式；机器人发送语音建议 `0` |
 | `ai_groupmate__voice_batch_size` | 否 | `1` | GPT-SoVITS batch size |
 | `ai_groupmate__voice_speed_factor` | 否 | `1.0` | 语速 |
@@ -232,7 +229,6 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_max_text_length` | 否 | `120` | 单条语音最大文本长度 |
 | `ai_groupmate__voice_ffmpeg_path` | 否 | `ffmpeg` | ffmpeg 可执行文件路径 |
 | `ai_groupmate__voice_ffmpeg_timeout_seconds` | 否 | `30.0` | ffmpeg 转码超时 |
-| `ai_groupmate__voice_ffmpeg_audio_filter` | 否 | 空 | 自定义 ffmpeg 音频滤镜；填写后优先于 `voice_volume_gain`，例如 `loudnorm=I=-10:TP=-1.5:LRA=7,aresample=32000` |
 | `ai_groupmate__voice_ffmpeg_audio_codec` | 否 | `libopencore_amrnb` | 转 AMR 时使用的音频编码器；如本机 ffmpeg 不支持可改配置 |
 | `ai_groupmate__voice_volume_gain` | 否 | `1.5` | 转码时的音量倍率；`1.0` 表示不放大 |
 | `ai_groupmate__voice_amr_sample_rate` | 否 | `8000` | AMR 采样率 |
@@ -285,11 +281,6 @@ ai_groupmate__voice_request_media_type=wav
 ai_groupmate__voice_output_format=wav
 ai_groupmate__voice_ffmpeg_path=ffmpeg
 ai_groupmate__voice_volume_gain=1.5
-# 如果 NoneBot 和 NapCat 共享同一个目录，可以用 path 发送；OneBot 会收到普通绝对路径。
-# ai_groupmate__voice_send_method=path
-# ai_groupmate__voice_send_dir=/app/.config/QQ/NapCat/temp
-# 如需更稳的响度处理，可用 loudnorm 替代简单音量放大。
-# ai_groupmate__voice_ffmpeg_audio_filter=loudnorm=I=-10:TP=-1.5:LRA=7,aformat=sample_fmts=s16:sample_rates=24000:channel_layouts=mono
 ```
 
 ### 当前 fork 推荐配置

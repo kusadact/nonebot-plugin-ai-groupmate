@@ -59,9 +59,6 @@ class ScopedConfig(BaseModel):
     voice_text_split_method: str = "cut5"
     voice_request_media_type: str = "wav"
     voice_output_format: str = "wav"
-    voice_send_method: str = "raw"
-    voice_send_dir: str = ""
-    voice_send_file_keep_seconds: float = 300.0
     voice_streaming_mode: int = 0
     voice_batch_size: int = 1
     voice_speed_factor: float = 1.0
@@ -71,7 +68,6 @@ class ScopedConfig(BaseModel):
     voice_max_text_length: int = 120
     voice_ffmpeg_path: str = "ffmpeg"
     voice_ffmpeg_timeout_seconds: float = 30.0
-    voice_ffmpeg_audio_filter: str = ""
     voice_ffmpeg_audio_codec: str = "libopencore_amrnb"
     voice_volume_gain: float = 1.5
     voice_amr_sample_rate: int = 8000
