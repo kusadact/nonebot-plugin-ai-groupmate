@@ -6,9 +6,11 @@ import json
 import re
 import base64
 import mimetypes
+import urllib.request
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config, get_driver
@@ -44,6 +46,7 @@ from .utils import (
 )
 from .config import Config
 from .memory import DB
+from .reply_guard import set_latest_request_id
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -100,6 +103,78 @@ multimodal_model = (
     if plugin_config.multimodal_model and _multimodal_api_key
     else None
 )
+
+
+@dataclass
+class ReplyRequest:
+    request_id: str
+    session: Uninfo
+    interface: QryItrface
+    bot_name: str
+    bot_id: str
+    user_id: str
+    user_name: str | None
+    is_tome: bool
+    bound_messages: list[dict[str, str]]
+    bound_images: list[dict[str, str]]
+    disable_inline_history_images: bool
+    binding_notice: str | None
+
+
+@dataclass
+class GroupReplyState:
+    running: bool = False
+    latest: ReplyRequest | None = None
+    task: asyncio.Task | None = None
+
+
+_group_reply_states: dict[str, GroupReplyState] = {}
+_group_reply_state_lock = asyncio.Lock()
+
+
+def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState) -> None:
+    state.running = True
+    state.task = asyncio.create_task(_run_group_reply_worker(group_id))
+
+
+async def _run_group_reply_worker(group_id: str) -> None:
+    try:
+        while True:
+            async with _group_reply_state_lock:
+                state = _group_reply_states.get(group_id)
+                if not state:
+                    return
+                request = state.latest
+                state.latest = None
+
+            if request is None:
+                break
+
+            async with get_session() as reply_session:
+                await handle_reply_logic(
+                    reply_session,
+                    request.request_id,
+                    request.session,
+                    request.interface,
+                    request.bot_name,
+                    request.bot_id,
+                    request.user_id,
+                    request.user_name,
+                    request.is_tome,
+                    request.bound_messages,
+                    request.bound_images,
+                    request.disable_inline_history_images,
+                    request.binding_notice,
+                )
+    finally:
+        async with _group_reply_state_lock:
+            state = _group_reply_states.get(group_id)
+            if not state:
+                return
+            state.running = False
+            state.task = None
+            if state.latest is not None:
+                _start_group_reply_worker_locked(group_id, state)
 
 
 def _extract_model_text(content: Any) -> str:
@@ -327,6 +402,21 @@ def _event_at_bot(event: Event, bot: Bot) -> bool:
     return False
 
 
+def _extract_reply_id_from_text(text: str) -> str | None:
+    patterns = (
+        r"\[reply:id=([^\],]+)[^\]]*\]",
+        r"\[CQ:reply,(?:[^\]]*,)?id=([^,\]]+)",
+        r"\breply:id=([^,\]\s]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            reply_id = match.group(1).strip()
+            if reply_id:
+                return reply_id
+    return None
+
+
 def _extract_reply_message_id_from_event(event: Event) -> str | None:
     def _pick_reply_id(obj: Any) -> str | None:
         if obj is None:
@@ -358,18 +448,490 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
 
             # OneBot v11 常见字符串形态：[reply:id=123456]
             text = str(raw_msg)
-            m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", text)
-            if m:
-                return m.group(1)
+            rid = _extract_reply_id_from_text(text)
+            if rid:
+                return rid
 
         # Last fallback: parse serialized event text.
         event_text = str(event)
-        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", event_text)
-        if m:
-            return m.group(1)
+        rid = _extract_reply_id_from_text(event_text)
+        if rid:
+            return rid
     except Exception:
         return None
     return None
+
+
+def _extract_content_body(content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+
+    body_start = 0
+    if lines[0].startswith("id:"):
+        body_start = 1
+        if len(lines) > 1 and lines[1].startswith("回复id:"):
+            body_start = 2
+
+    return "\n".join(lines[body_start:]).strip()
+
+
+def _guess_image_format(raw_id: str | None) -> str:
+    image_id = str(raw_id or "").strip()
+    image_id = image_id.split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
+    if "." in image_id:
+        ext = image_id.rsplit(".", 1)[-1].strip().lower()
+        if ext:
+            return ext
+    return "jpg"
+
+
+def _image_bytes_to_data_uri(image_bytes: bytes, image_format: str | None = None) -> str:
+    normalized_format = (image_format or "jpg").strip().lower()
+    mime_type = mimetypes.guess_type(f"image.{normalized_format}")[0] or f"image/{normalized_format}"
+    payload = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{payload}"
+
+
+def _iter_message_segments(message_obj: Any):
+    if message_obj is None:
+        return
+
+    if isinstance(message_obj, dict):
+        seg_type = message_obj.get("type")
+        if seg_type:
+            yield message_obj
+        return
+
+    if isinstance(message_obj, (bytes, bytearray)):
+        message_obj = message_obj.decode("utf-8", errors="ignore")
+
+    if isinstance(message_obj, str):
+        for match in re.finditer(r"\[CQ:(\w+),([^\]]*)\]", message_obj):
+            seg_data: dict[str, str] = {}
+            raw_data = match.group(2)
+            if raw_data:
+                for item in raw_data.split(","):
+                    if "=" not in item:
+                        continue
+                    key, value = item.split("=", 1)
+                    seg_data[key] = value
+            yield {"type": match.group(1), "data": seg_data}
+        return
+
+    try:
+        iterator = iter(message_obj)
+    except TypeError:
+        return
+
+    for seg in iterator:
+        yield seg
+
+
+def _segment_type_and_data(seg: Any) -> tuple[str | None, dict[str, Any]]:
+    if isinstance(seg, dict):
+        seg_type = seg.get("type")
+        seg_data = seg.get("data") or {}
+        return seg_type, seg_data if isinstance(seg_data, dict) else {}
+
+    seg_type = getattr(seg, "type", None)
+    seg_data = getattr(seg, "data", None) or {}
+    return seg_type, seg_data if isinstance(seg_data, dict) else {}
+
+
+def _extract_text_from_message_obj(message_obj: Any) -> str:
+    parts: list[str] = []
+    for seg in _iter_message_segments(message_obj):
+        seg_type, seg_data = _segment_type_and_data(seg)
+        if seg_type != "text":
+            continue
+        text = str(seg_data.get("text") or "").strip()
+        if text:
+            parts.append(text)
+
+    if parts:
+        return " ".join(parts)
+
+    if isinstance(message_obj, str):
+        text = re.sub(r"\[CQ:[^\]]+\]", "", message_obj)
+        return re.sub(r"\s+", " ", text).strip()
+
+    return ""
+
+
+def _download_bytes_from_url(url: str, timeout: float = 15.0) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "nonebot-plugin-ai-groupmate/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _extract_reply_payload_from_event(event: Event, reply_to_message_id: str) -> Any | None:
+    event_reply = getattr(event, "reply", None)
+    if event_reply is None:
+        return None
+
+    payload_reply_id = getattr(event_reply, "message_id", None) or getattr(event_reply, "id", None)
+    if payload_reply_id is None:
+        return event_reply
+
+    if str(payload_reply_id).strip() == str(reply_to_message_id).strip():
+        return event_reply
+    return None
+
+
+async def _resolve_reply_image_source(
+    bot: Bot,
+    seg_data: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    direct_url = str(seg_data.get("url") or "").strip()
+    if direct_url:
+        return "url", direct_url
+
+    file_id = str(seg_data.get("file") or "").strip()
+    if not file_id:
+        return None, None
+
+    try:
+        image_info = await asyncio.wait_for(bot.call_api("get_image", file=file_id), timeout=10.0)
+    except Exception as e:
+        logger.warning(f"通过 get_image 获取被回复图片失败 file={file_id}: {type(e).__name__}: {e}")
+        return None, None
+
+    local_path = str((image_info or {}).get("file") or "").strip()
+    if local_path and Path(local_path).exists():
+        return "path", local_path
+
+    image_url = str((image_info or {}).get("url") or "").strip()
+    if image_url:
+        return "url", image_url
+
+    return None, None
+
+
+def _payload_sender_name(payload: Any) -> str:
+    sender = getattr(payload, "sender", None)
+    if sender is None and isinstance(payload, dict):
+        sender = payload.get("sender")
+    if isinstance(sender, dict):
+        return str(sender.get("card") or sender.get("nickname") or sender.get("user_id") or "").strip()
+    if sender is not None:
+        return str(
+            getattr(sender, "card", None)
+            or getattr(sender, "nickname", None)
+            or getattr(sender, "user_id", None)
+            or ""
+        ).strip()
+    return ""
+
+
+def _build_bound_message(
+    label: str,
+    user_name: str,
+    content_type: str,
+    text: str,
+    msg_id: str | int | None = None,
+) -> dict[str, str]:
+    item = {
+        "label": label,
+        "user_name": user_name,
+        "content_type": content_type,
+        "text": text,
+    }
+    if msg_id is not None:
+        item["msg_id"] = str(msg_id)
+    return item
+
+
+async def _build_reply_binding_from_payload(
+    bot: Bot,
+    payload: Any,
+    reply_to_message_id: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+    message_obj = getattr(payload, "message", None)
+    if message_obj is None and isinstance(payload, dict):
+        message_obj = payload.get("message")
+    if message_obj is None:
+        return [], [], False
+
+    note = _extract_text_from_message_obj(message_obj)
+    bound_messages: list[dict[str, str]] = []
+    if note:
+        bound_messages.append(
+            _build_bound_message(
+                "被回复消息",
+                _payload_sender_name(payload),
+                "text",
+                note,
+                reply_to_message_id,
+            )
+        )
+
+    bound_images: list[dict[str, str]] = []
+    saw_image = False
+
+    for seg in _iter_message_segments(message_obj):
+        seg_type, seg_data = _segment_type_and_data(seg)
+        if seg_type != "image":
+            continue
+
+        saw_image = True
+        source_kind, source_value = await _resolve_reply_image_source(bot, seg_data)
+        if not source_kind or not source_value:
+            continue
+
+        image_format = _guess_image_format(seg_data.get("file") or source_value)
+        try:
+            if source_kind == "path":
+                image_bytes = await asyncio.to_thread(Path(source_value).read_bytes)
+            else:
+                image_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(_download_bytes_from_url, source_value, 15.0),
+                    timeout=20.0,
+                )
+            image_bytes = await asyncio.to_thread(
+                check_and_compress_image_bytes,
+                image_bytes,
+                image_format=image_format.upper(),
+            )
+        except Exception as e:
+            logger.warning(
+                f"读取被回复图片失败 msg_id={reply_to_message_id} source={source_kind}: {type(e).__name__}: {e}"
+            )
+            continue
+
+        bound_image = {
+            "label": "被回复图片" if not bound_images else f"被回复图片{len(bound_images) + 1}",
+            "image_url": _image_bytes_to_data_uri(image_bytes, image_format),
+        }
+        if note:
+            bound_image["note"] = note[:80]
+        bound_images.append(bound_image)
+
+    return bound_messages, bound_images, saw_image
+
+
+async def _build_reply_binding_from_api(
+    event: Event,
+    bot: Bot,
+    reply_to_message_id: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+    normalized_reply_id = str(reply_to_message_id).strip()
+    if not normalized_reply_id:
+        return [], [], False
+
+    payload = _extract_reply_payload_from_event(event, normalized_reply_id)
+    if payload is not None:
+        bound_messages, bound_images, saw_image = await _build_reply_binding_from_payload(bot, payload, normalized_reply_id)
+        if bound_messages or bound_images:
+            logger.info(
+                f"命中事件回复消息绑定 msg_id={normalized_reply_id} "
+                f"messages={len(bound_messages)} images={len(bound_images)}"
+            )
+            return bound_messages, bound_images, saw_image
+
+    try:
+        api_message_id = int(normalized_reply_id)
+    except ValueError:
+        logger.info(f"跳过 get_msg API 回溯，reply id 非数字 msg_id={normalized_reply_id}")
+        return [], [], False
+
+    try:
+        payload = await asyncio.wait_for(
+            bot.call_api("get_msg", message_id=api_message_id),
+            timeout=10.0,
+        )
+    except Exception as e:
+        logger.warning(f"获取被回复消息失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+        return [], [], False
+
+    bound_messages, bound_images, saw_image = await _build_reply_binding_from_payload(bot, payload, normalized_reply_id)
+    if bound_messages or bound_images:
+        logger.info(
+            f"命中 API 回复消息绑定 msg_id={normalized_reply_id} "
+            f"messages={len(bound_messages)} images={len(bound_images)}"
+        )
+    return bound_messages, bound_images, saw_image
+
+
+async def _build_current_event_bound_images(
+    imgs: list[Image],
+    event: Event,
+    bot: Bot,
+    state: T_State,
+) -> list[dict[str, str]]:
+    bound_images: list[dict[str, str]] = []
+
+    for idx, img in enumerate(imgs):
+        image_format = _guess_image_format(getattr(img, "id", None))
+        try:
+            image_bytes = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
+            image_bytes = await asyncio.to_thread(
+                check_and_compress_image_bytes,
+                image_bytes,
+                image_format=image_format.upper(),
+            )
+            bound_images.append(
+                {
+                    "label": "当前消息图片" if idx == 0 else f"当前消息图片{idx + 1}",
+                    "image_url": _image_bytes_to_data_uri(image_bytes, image_format),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"构建当前消息重点图片失败 idx={idx} error={type(e).__name__}: {e}")
+
+    return bound_images
+
+
+async def _build_reply_binding(
+    db_session,
+    session_id: str,
+    reply_to_message_id: str | None,
+    event: Event,
+    bot: Bot,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool, str | None]:
+    if not reply_to_message_id:
+        return [], [], False, None
+
+    normalized_reply_id = str(reply_to_message_id).strip()
+    if not normalized_reply_id:
+        return [], [], False, None
+
+    base_stmt = (
+        Select(ChatHistory)
+        .where(
+            ChatHistory.session_id == session_id,
+        )
+        .order_by(ChatHistory.msg_id.asc())
+    )
+    replied_messages: list[ChatHistory] = []
+    seen_msg_ids: set[int] = set()
+    for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
+        stmt = base_stmt.where(ChatHistory.content.contains(marker))
+        rows = (await db_session.execute(stmt)).scalars().all()
+        for msg in rows:
+            content_lines = msg.content.splitlines()
+            if not content_lines or not content_lines[0].startswith("id:"):
+                continue
+            own_id = content_lines[0].split(":", 1)[1].strip()
+            if own_id != normalized_reply_id:
+                continue
+            msg_id = int(msg.msg_id)
+            if msg_id in seen_msg_ids:
+                continue
+            seen_msg_ids.add(msg_id)
+            replied_messages.append(msg)
+
+    replied_messages.sort(key=lambda item: item.msg_id)
+
+    bound_messages: list[dict[str, str]] = []
+    bound_images: list[dict[str, str]] = []
+    media_ids: list[int] = []
+    image_rows = 0
+    for msg in replied_messages:
+        body = _extract_content_body(msg.content)
+        if msg.content_type == "text" or msg.content_type == "bot":
+            if body:
+                bound_messages.append(
+                    _build_bound_message("被回复消息", msg.user_name, msg.content_type, body, msg.msg_id)
+                )
+            continue
+
+        if msg.content_type != "image":
+            continue
+
+        image_rows += 1
+        image_text = body if body and body != "[图片]" else "[图片]"
+        bound_messages.append(
+            _build_bound_message("被回复图片消息", msg.user_name, "image", image_text, msg.msg_id)
+        )
+        if msg.media_id is None:
+            continue
+        media_obj = await db_session.get(MediaStorage, msg.media_id)
+        if media_obj is None or not media_obj.file_path:
+            continue
+        file_path = pic_dir / media_obj.file_path
+        if not file_path.exists():
+            continue
+        try:
+            image_url = _image_to_data_uri(file_path)
+            bound_image = {
+                "label": "被回复图片" if not bound_images else f"被回复图片{len(bound_images) + 1}",
+                "image_url": image_url,
+            }
+            note = _extract_content_body(msg.content)
+            if note and note != "[图片]":
+                bound_image["note"] = note[:80]
+            bound_images.append(bound_image)
+            media_ids.append(int(msg.media_id))
+        except Exception as e:
+            logger.warning(f"读取本地被回复图片失败 msg_id={normalized_reply_id}: {type(e).__name__}: {e}")
+
+    if bound_messages or bound_images:
+        logger.info(
+            f"命中本地被回复消息绑定 msg_id={normalized_reply_id} "
+            f"messages={len(bound_messages)} images={len(bound_images)} media_ids={media_ids}"
+        )
+        if image_rows > 0 and not bound_images:
+            logger.warning(f"被回复消息含图片但本地图片无法加载 msg_id={normalized_reply_id}，尝试 API 解析")
+        else:
+            return bound_messages, bound_images, False, None
+
+    logger.info(f"本地未完整命中被回复消息，尝试 API 解析 msg_id={normalized_reply_id}")
+    api_bound_messages, api_bound_images, api_saw_image = await _build_reply_binding_from_api(event, bot, normalized_reply_id)
+    if api_bound_messages or api_bound_images:
+        if api_saw_image and not api_bound_images:
+            notice = (
+                f"【回复绑定提示】本轮消息回复了 id={normalized_reply_id} 的旧消息，"
+                "已解析到被回复消息文字，但其中图片没有加载成功。不要把最近历史图片当成这次回复指向的图片；"
+                "如果需要图片内容，请直接说明图片未加载。"
+            )
+            return api_bound_messages, api_bound_images, True, notice
+        return api_bound_messages, api_bound_images, False, None
+
+    if bound_messages and image_rows > 0 and not bound_images:
+        notice = (
+            f"【回复绑定提示】本轮消息回复了 id={normalized_reply_id} 的旧消息，"
+            "已命中被回复消息记录，但其中图片没有加载成功。不要把最近历史图片当成这次回复指向的图片；"
+            "如果需要图片内容，请直接说明图片未加载。"
+        )
+        return bound_messages, bound_images, True, notice
+
+    notice = (
+        f"【回复绑定提示】本轮消息显式回复了 id={normalized_reply_id} 的旧消息，"
+        "但当前没有解析到被回复消息内容。不要把最近历史消息或图片当成这次回复指向的对象；"
+        "如果信息不足，请直接说明。"
+    )
+    should_disable_inline_images = image_rows > 0 or api_saw_image or not bound_messages
+    logger.warning(f"被回复消息仍未解析成功 msg_id={normalized_reply_id} disable_inline_images={should_disable_inline_images}")
+    return bound_messages, bound_images, should_disable_inline_images, notice
+
+
+async def _build_bound_context(
+    db_session,
+    imgs: list[Image],
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session_id: str,
+    reply_to_message_id: str | None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool, str | None]:
+    bound_messages: list[dict[str, str]] = []
+    bound_images: list[dict[str, str]] = []
+    disable_inline_history_images = False
+    binding_notice: str | None = None
+    if imgs:
+        bound_images.extend(await _build_current_event_bound_images(imgs, event, bot, state))
+    if reply_to_message_id:
+        reply_bound_messages, reply_bound_images, disable_inline_history_images, binding_notice = await _build_reply_binding(
+            db_session,
+            session_id,
+            reply_to_message_id,
+            event,
+            bot,
+        )
+        bound_messages.extend(reply_bound_messages)
+        bound_images.extend(reply_bound_images)
+    return bound_messages, bound_images, disable_inline_history_images, binding_notice
 
 
 async def _plain_text_mentions_bot(plain_text: str, bot: Bot, session: Uninfo, interface: QryItrface) -> bool:
@@ -623,16 +1185,25 @@ record = on_message(
 
 
 @record.handle()
-async def handle_message(db_session: async_scoped_session, msg: UniMsg, session: Uninfo, event: Event, bot: Bot, state: T_State, interface: QryItrface):
+async def handle_message(
+    db_session: async_scoped_session,
+    msg: UniMsg,
+    session: Uninfo,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    interface: QryItrface,
+):
     """处理消息的主函数"""
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
+    body = ""
     to_me = False
     is_text = False
     reply_to_message_id: str | None = None
     if event.is_tome() or _event_at_bot(event, bot):
         to_me = True
-        content += f"@{plugin_config.bot_name} "
+        body += f"@{plugin_config.bot_name} "
 
     at_targets: list[str] = []
     for i in msg:
@@ -649,7 +1220,7 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
                     break
             else:
                 continue
-            content += "@" + name + " "
+            body += "@" + name + " "
             is_text = True
         if i.type == "reply":
             rid = str(getattr(i, "id", "") or "").strip()
@@ -661,30 +1232,23 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
                 rid = str(getattr(i, "message_id", "") or "").strip()
             if rid and not reply_to_message_id:
                 reply_to_message_id = rid
-                content += "回复id:" + rid
         if i.type == "text":
-            content += i.text
+            body += i.text
             is_text = True
 
     if not reply_to_message_id:
         reply_to_message_id = _extract_reply_message_id_from_event(event)
     if not reply_to_message_id:
-        m = re.search(r"(?:\[)?reply:id=(\d+)(?:\])?", str(msg))
-        if m:
-            reply_to_message_id = m.group(1)
+        reply_to_message_id = _extract_reply_id_from_text(str(msg))
 
-    # 构建用户名（包含昵称和职位）
-    user_name = session.user.name
-    if session.member:
-        if session.member.nick:
-            user_name = f"({session.member.nick}){user_name}"
-        if session.member.role:
-            if session.member.role.name == "owner":
-                user_name = f"群主-{user_name}"
-            elif session.member.role.name == "admin":
-                user_name = f"管理员-{user_name}"
+    if reply_to_message_id:
+        content += f"回复id: {reply_to_message_id}\n"
+    content += body
 
-    # ========== 步骤1: 处理文本消息（快速） ==========
+    user_name = session.user.name or session.user.nick or session.user.id
+    if session.member and session.member.nick:
+        user_name = session.member.nick
+
     if is_text:
         chat_history = ChatHistory(
             session_id=session.scene.id,
@@ -695,18 +1259,26 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         )
         db_session.add(chat_history)
 
-    # 立即提交文本消息
     try:
         await db_session.commit()
     except Exception as e:
         logger.error(f"保存文本消息失败: {e}")
         await db_session.rollback()
 
-    # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
     image_content_prefix = f"id: {get_message_id()}\n"
+    if reply_to_message_id:
+        image_content_prefix += f"回复id: {reply_to_message_id}\n"
     for img in imgs:
         asyncio.create_task(
-            _process_image_task(img, event, bot, state, session, user_name, image_content_prefix)
+            _process_image_task(
+                img,
+                event,
+                bot,
+                state,
+                session,
+                user_name,
+                image_content_prefix,
+            )
         )
 
     plain_text = (msg.extract_plain_text() or event.get_plaintext() or "").strip()
@@ -724,9 +1296,7 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
     if not _is_enabled():
         return
 
-    # ========== 步骤3: 决定是否回复 ==========
     plain_event_text = event.get_plaintext() or ""
-
     bot_name_l = (plugin_config.bot_name or "").strip().lower()
     if bot_name_l and (
         plain_text.lower().startswith(bot_name_l)
@@ -746,23 +1316,56 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         should_reply = False
     if plain_event_text.startswith(("!", "！", "/", "#", "?", "\\")):
         should_reply = False
-    if not plain_event_text and not event.is_tome():
+    if not plain_event_text and not to_me:
         should_reply = False
+
     if to_me:
         user_id = session.user.id
         user_name = session.user.name or session.user.nick
     else:
         user_id = ""
         user_name = ""
+
     if should_reply:
-        await handle_reply_logic(
+        group_id = session.scene.id
+        bound_messages, bound_images, disable_inline_history_images, binding_notice = await _build_bound_context(
             db_session,
-            session,
-            plugin_config.bot_name,
-            user_id,
-            user_name,
-            to_me,
+            imgs,
+            event,
+            bot,
+            state,
+            group_id,
+            reply_to_message_id,
         )
+        request = ReplyRequest(
+            request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
+            session=session,
+            interface=interface,
+            bot_name=plugin_config.bot_name,
+            bot_id=str(bot.self_id),
+            user_id=user_id,
+            user_name=user_name,
+            is_tome=to_me,
+            bound_messages=bound_messages,
+            bound_images=bound_images,
+            disable_inline_history_images=disable_inline_history_images,
+            binding_notice=binding_notice,
+        )
+        await set_latest_request_id(group_id, request.request_id)
+        async with _group_reply_state_lock:
+            reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
+            reply_state.latest = request
+            if reply_state.running:
+                if reply_state.task and not reply_state.task.done():
+                    reply_state.task.cancel()
+                    logger.info(f"群 {group_id} 收到更新请求，已取消旧回复并切换到最新")
+                else:
+                    logger.warning(
+                        f"群 {group_id} 回复状态异常（running=True 但 worker 不可用），已重启并切换到最新请求"
+                    )
+                    _start_group_reply_worker_locked(group_id, reply_state)
+            else:
+                _start_group_reply_worker_locked(group_id, reply_state)
 
     await db_session.commit()
 
@@ -884,23 +1487,36 @@ def _clean_gate_text(content: str) -> str:
 
 async def handle_reply_logic(
     db_session,
+    request_id: str,
     session: Uninfo,
+    interface: QryItrface,
     bot_name: str,
+    bot_id: str,
     user_id: str,
     user_name: str | None,
     is_tome: bool,
+    bound_messages: list[dict[str, str]] | None = None,
+    bound_images: list[dict[str, str]] | None = None,
+    disable_inline_history_images: bool = False,
+    binding_notice: str | None = None,
 ):
     """处理回复逻辑"""
     try:
-        # 非 @bot / 非明确点名时，先做一次轻量前置判断，避免频繁启动主 Agent。
         recent_msgs = (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id)
-                .order_by(ChatHistory.msg_id.desc())
-                .limit(3)
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session.scene.id,
+                        ChatHistory.content_type != "bot",
+                    )
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(3)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         recent_msgs = recent_msgs[::-1]
 
         if not recent_msgs:
@@ -929,36 +1545,72 @@ async def handle_reply_logic(
                 logger.debug(f"前置判断拒绝回复 session={session.scene.id}")
                 return
 
-        # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
-        last_msg = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session.scene.id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(20))).scalars().all()
+        last_msg = (
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(ChatHistory.session_id == session.scene.id)
+                    .where(ChatHistory.created_at >= cutoff_time)
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(20)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
 
-        # 转换为模型对象并反转顺序（从旧到新）
         last_msg = [ChatHistorySchema.model_validate(m) for m in last_msg]
         last_msg = last_msg[::-1]
 
-        # 使用Agent决定回复策略
+        role_map: dict[str, str] = {}
+        try:
+            members = await interface.get_members(SceneType.GROUP, session.scene.id)
+            for member in members:
+                role_name = getattr(getattr(member, "role", None), "name", None)
+                if role_name in {"owner", "admin"}:
+                    role_map[str(member.id)] = role_name
+        except Exception as e:
+            logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
+
         logger.info("开始调用Agent决策...")
         try:
             await asyncio.wait_for(
                 choice_response_strategy(
                     db_session,
                     session.scene.id,
+                    request_id,
                     last_msg,
                     user_id,
                     user_name,
+                    is_tome,
                     plugin_config.personality_setting,
+                    interface,
+                    role_map,
+                    bot_id,
+                    bound_messages,
+                    bound_images,
+                    disable_inline_history_images,
+                    binding_notice,
                 ),
-                timeout=120.0,
+                timeout=240.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时，跳过回复 - session: {session.scene.id}")
             return
+        except asyncio.CancelledError:
+            logger.info(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
+            await db_session.rollback()
+            raise
 
+    except asyncio.CancelledError:
+        logger.info(f"群 {session.scene.id} 回复任务被取消（主流程中断）")
+        await db_session.rollback()
+        raise
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()

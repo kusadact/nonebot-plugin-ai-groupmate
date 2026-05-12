@@ -1698,9 +1698,10 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.0.1.post1"
+version = "2.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "jieba" },
     { name = "langchain" },
     { name = "langchain-core" },
@@ -1733,6 +1734,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "langchain", specifier = ">=1.1.0" },
     { name = "langchain-core", specifier = ">=1.1.0" },

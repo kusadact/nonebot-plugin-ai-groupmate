@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.0.1.post1"
+version = "2.1.0"
 description = "AI 群友 NoneBot 插件 fork"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -8,6 +8,7 @@ authors = [
     { name = "kusadact", email = "959472968@qq.com" },
 ]
 dependencies = [
+    "httpx>=0.28.1",
     "jieba>=0.42.1",
     "langchain>=1.1.0",
     "langchain-core>=1.1.0",

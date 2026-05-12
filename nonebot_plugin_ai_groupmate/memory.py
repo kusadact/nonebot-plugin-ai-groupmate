@@ -19,11 +19,11 @@ from .config import Config
 
 CHAT_COLLECTION = "chat_collection"
 MEDIA_COLLECTION = "media_collection"
-MEDIA_SEARCH_RECALL_LIMIT = 20
-MEDIA_SEARCH_RETURN_LIMIT = 5
 DASHSCOPE_MULTIMODAL_BATCH_LIMIT = 5
 
 plugin_config = get_plugin_config(Config).ai_groupmate
+MEDIA_SEARCH_RECALL_LIMIT = max(1, int(plugin_config.media_search_recall_limit))
+MEDIA_SEARCH_RETURN_LIMIT = max(1, int(plugin_config.media_search_return_limit))
 
 
 def _image_to_base64(image_input: str) -> str:
