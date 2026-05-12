@@ -58,7 +58,7 @@ class ScopedConfig(BaseModel):
     voice_prompt_lang: str = "zh"
     voice_text_split_method: str = "cut5"
     voice_request_media_type: str = "wav"
-    voice_output_format: str = "amr"
+    voice_output_format: str = "wav"
     voice_streaming_mode: int = 0
     voice_batch_size: int = 1
     voice_speed_factor: float = 1.0

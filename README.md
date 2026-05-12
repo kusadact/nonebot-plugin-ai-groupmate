@@ -219,7 +219,7 @@ nb -py /path/to/python orm upgrade
 | `ai_groupmate__voice_prompt_lang` | 否 | `zh` | 参考音频语言 |
 | `ai_groupmate__voice_text_split_method` | 否 | `cut5` | GPT-SoVITS 分句方式 |
 | `ai_groupmate__voice_request_media_type` | 否 | `wav` | GPT-SoVITS 返回格式 |
-| `ai_groupmate__voice_output_format` | 否 | `amr` | bot 最终发送格式；NapCat 推荐 `amr` |
+| `ai_groupmate__voice_output_format` | 否 | `wav` | bot 最终发送格式；NapCat 会自行转码发送语音，通常保持 `wav` 即可 |
 | `ai_groupmate__voice_streaming_mode` | 否 | `0` | GPT-SoVITS 流式模式；机器人发送语音建议 `0` |
 | `ai_groupmate__voice_batch_size` | 否 | `1` | GPT-SoVITS batch size |
 | `ai_groupmate__voice_speed_factor` | 否 | `1.0` | 语速 |
@@ -276,9 +276,9 @@ ai_groupmate__voice_trust_env_proxy=false
 ai_groupmate__voice_ref_audio_path=ref_audio/Azuma/Azuma_10.wav
 ai_groupmate__voice_prompt_text=完了我找不到他之前的投稿了，反正就是有一个。
 
-# NapCat 推荐最终发送 AMR；GPT-SoVITS 仍可先返回 WAV，再由 ffmpeg 转码。
+# NapCat 发送语音时会自行转码；通常保留 WAV，避免先转 AMR 后再被二次转码。
 ai_groupmate__voice_request_media_type=wav
-ai_groupmate__voice_output_format=amr
+ai_groupmate__voice_output_format=wav
 ai_groupmate__voice_ffmpeg_path=ffmpeg
 ai_groupmate__voice_volume_gain=1.5
 ```

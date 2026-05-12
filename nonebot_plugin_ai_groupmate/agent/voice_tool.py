@@ -77,7 +77,8 @@ def _is_voice_configured(config: ScopedConfig) -> bool:
 def _conversion_requirement_detail(config: ScopedConfig) -> str | None:
     source_format = _normalize_audio_format(config.voice_request_media_type)
     target_format = _normalize_audio_format(config.voice_output_format)
-    if source_format == target_format:
+    audio_filter = _build_ffmpeg_audio_filter(config)
+    if source_format == target_format and not audio_filter:
         return None
 
     ffmpeg_path = (config.voice_ffmpeg_path or "ffmpeg").strip() or "ffmpeg"
@@ -90,7 +91,7 @@ def _conversion_requirement_detail(config: ScopedConfig) -> str | None:
         if not ffmpeg_executable:
             return f"找不到 ffmpeg: {ffmpeg_path}"
 
-    codec = (config.voice_ffmpeg_audio_codec or "").strip()
+    codec = (config.voice_ffmpeg_audio_codec or "").strip() if target_format == "amr" else ""
     if codec and not _ffmpeg_encoder_available(str(ffmpeg_executable), codec):
         return f"ffmpeg 不支持编码器: {codec}"
     return None
@@ -235,7 +236,8 @@ async def _request_tts_audio(config: ScopedConfig, text: str) -> bytes:
 def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, config: ScopedConfig) -> bytes:
     source_format = _normalize_audio_format(source_format)
     target_format = _normalize_audio_format(target_format)
-    if source_format == target_format:
+    audio_filter = _build_ffmpeg_audio_filter(config)
+    if source_format == target_format and not audio_filter:
         return audio
 
     ffmpeg_path = (config.voice_ffmpeg_path or "ffmpeg").strip() or "ffmpeg"
@@ -255,11 +257,11 @@ def _convert_audio_sync(audio: bytes, source_format: str, target_format: str, co
             str(source_path),
         ]
 
+        if audio_filter:
+            command.extend(["-af", audio_filter])
+
         if target_format == "amr":
             command.extend(["-ar", str(int(config.voice_amr_sample_rate)), "-ac", "1"])
-            audio_filter = _build_ffmpeg_audio_filter(config)
-            if audio_filter:
-                command.extend(["-af", audio_filter])
             if (config.voice_ffmpeg_audio_codec or "").strip():
                 command.extend(["-c:a", config.voice_ffmpeg_audio_codec.strip()])
             if (config.voice_amr_bitrate or "").strip():
