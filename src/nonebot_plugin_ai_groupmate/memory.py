@@ -32,6 +32,8 @@ MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
 # text 模式（meme_embedding_mode="text"）专用：纯文本向量集合
 MEDIA_TEXT_COL = "media_collection_text"
+# embedding 维度能力探测失败后的重试冷却（秒），避免故障期间请求放大。
+PROBE_RETRY_COOLDOWN_SECONDS = 30.0
 # Qdrant collection metadata keys used to pin an embedding space to a collection.
 EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
 EMBEDDING_DIMENSION_METADATA_KEY = "embedding_dimension"
@@ -96,16 +98,21 @@ class VectorDBOperator:
     ] | None = None
     _text_embedding_validation_error: CollectionEmbeddingConfigMismatchError | None = None
     _text_embedding_probe_done: bool = False
+    _use_dimensions: bool | None = None
+    _last_probe_failure_at: float | None = None
 
     def __init__(self):
         self._configure()
 
     def _configure(self) -> None:
         self._init_lock = asyncio.Lock()
+        self._probe_lock = asyncio.Lock()
         self._ready_collections: set[str] = set()
         self._collection_validation_errors = {}
         self._text_embedding_validation_error = None
         self._text_embedding_probe_done = False
+        self._use_dimensions = None
+        self._last_probe_failure_at = None
         self.effective_meme_embedding_mode = (
             "text"
             if plugin_config.meme_embedding_mode == "text"
@@ -483,12 +490,23 @@ class VectorDBOperator:
                 and needs_text_embedding
                 and getattr(self, "emb_client", None) is not None
             ):
-                try:
-                    await self._probe_text_embedding_dimension()
-                except EmbeddingProviderUnavailableError:
-                    # 探针失败通常是临时网络/API 故障；让实际文本调用走原有
-                    # 降级逻辑，且不要阻断多模态 collection 的初始化。
-                    pass
+                # 统一走带冷却与锁的探测入口：文本集合尚未创建时（如全新
+                # 部署或重建 chat_collection 后），每次操作都会重新进入本
+                # 函数；若此处直接探测，冷却期内每次操作仍会发送失败的
+                # embedding 请求，放大故障并可能触发限流。
+                await self._ensure_embedding_capability_probed()
+
+            # probe 未决时不能确认文本集合的嵌入维度：若现在按配置创建，
+            # 之后解析为永久拒绝时集合已以错误维度存在，仍须手动删除。
+            # 已存在的集合照常走上面的 validate 分支，多模态集合不受影响。
+            # 未配置 emb_client 时无文本向量能力，不阻止集合创建（由后续
+            # 调用方按自身职责判断）。
+            capability_undecided = (
+                needs_text_embedding
+                and getattr(self, "emb_client", None) is not None
+                and self._use_dimensions is None
+            )
+            text_collection_names = self._text_collection_names()
 
             for collection_name, model, dimension, expected_schema in collection_specs:
                 if collection_name not in requested_names:
@@ -503,6 +521,12 @@ class VectorDBOperator:
                         expected_schema,
                     )
                     ready_collections.add(collection_name)
+                    continue
+                if capability_undecided and collection_name in text_collection_names:
+                    logger.warning(
+                        "Embedding 维度能力未确认，暂不创建文本集合: "
+                        f"collection={collection_name!r}"
+                    )
                     continue
 
                 if expected_schema.keys() == {""}:
@@ -550,13 +574,43 @@ class VectorDBOperator:
         if getattr(self, "_text_embedding_probe_done", False):
             return
         try:
+            # 先不带 dimensions 探测：部分 provider（如硅基流动的 BAAI/bge-m3）
+            # 不支持 dimensions 请求字段，但默认输出维度恰好匹配配置。
             response = await self.emb_client.embeddings.create(
                 input=["embedding dimension validation probe"],
                 model=self.emb_model,
             )
             if not response.data:
                 raise ValueError("Embedding API 返回空结果")
+            default_dimension = len(response.data[0].embedding)
+            if default_dimension == self.text_embedding_dimension:
+                # 默认输出维度与配置一致，无需传 dimensions。
+                self._use_dimensions = False
+                self._text_embedding_probe_done = True
+                return
+            # 默认维度不匹配，尝试显式请求 dimensions（仅部分模型支持）。
+            try:
+                response = await self.emb_client.embeddings.create(
+                    input=["embedding dimension validation probe"],
+                    model=self.emb_model,
+                    dimensions=self.text_embedding_dimension,
+                )
+            except Exception as exc:
+                if self._is_unsupported_dimensions_error(exc):
+                    # 默认维度不匹配且 provider 明确拒绝 dimensions 参数：
+                    # 这是配置不匹配，而非临时故障。若不在此处拒绝，调用方
+                    # 会按配置维度创建集合，之后的每次 embedding 请求都会
+                    # 永久失败校验，用户只能删除本不该创建的集合。
+                    self._reject_validation(
+                        "Embedding 模型不支持 dimensions 参数，且默认输出维度"
+                        f"({default_dimension})与配置维度({self.text_embedding_dimension})"
+                        "不一致，拒绝使用向量库；请更换模型或修正 embedding_dimension"
+                    )
+                raise
+            if not response.data:
+                raise ValueError("Embedding API 返回空结果")
             self._validate_text_embedding_dimension(response.data[0].embedding)
+            self._use_dimensions = True
             self._text_embedding_probe_done = True
         except CollectionEmbeddingConfigMismatchError:
             raise
@@ -567,6 +621,62 @@ class VectorDBOperator:
                 f"error={exc}"
             )
             raise EmbeddingProviderUnavailableError(str(exc)) from exc
+
+    @staticmethod
+    def _is_unsupported_dimensions_error(exc: Exception) -> bool:
+        """判断异常是否表示 provider 不支持 dimensions 请求字段。
+
+        仅当异常消息明确涉及 dimensions 参数时才判为"不支持"：400/404
+        可能由其他原因（如网关瞬时 400）触发，仅凭状态码误判会把瞬态
+        错误当成永久配置错误，导致所有向量操作被永久拒绝。
+        """
+        message = str(exc).lower()
+        if "dimension" not in message:
+            return False
+        unsupported_hints = (
+            "unsupported parameter",
+            "unknown parameter",
+            "unexpected parameter",
+            "not support",
+            "does not support",
+            "invalid parameter",
+        )
+        return any(hint in message for hint in unsupported_hints)
+
+    async def _ensure_embedding_capability_probed(self) -> bool:
+        """确保 embedding 维度能力已探测；已决返回 True。
+
+        能力未决（_use_dimensions 仍为 None）时重试探测；瞬态故障（如
+        429/网络中断）下保持未决并返回 False，调用方应降级跳过请求，
+        而不是发出不带 dimensions 的请求：那会拿到模型默认维度向量并
+        触发永久校验拒绝，即使 provider 恢复也无法恢复。
+
+        探测使用独立锁串行化，避免并发首请求同时探测放大 API 调用；
+        失败后进入冷却期，避免故障期间每个请求都重跑完整探测。
+        """
+        if self._use_dimensions is not None:
+            return True
+        last_failure = self._last_probe_failure_at
+        if last_failure is not None and time.monotonic() - last_failure < PROBE_RETRY_COOLDOWN_SECONDS:
+            return False
+        if getattr(self, "emb_client", None) is None:
+            return False
+        async with self._probe_lock:
+            if self._use_dimensions is not None:
+                return True
+            # 锁外检查可能基于过时的失败时间：并发请求在首个探测在途时
+            # 都读到 None，等锁期间首个探测失败并记录了失败时间。必须
+            # 在锁内复查冷却，否则每个等待者都会重跑一次完整探测，
+            # 放大瞬时故障或限流。
+            last_failure = self._last_probe_failure_at
+            if last_failure is not None and time.monotonic() - last_failure < PROBE_RETRY_COOLDOWN_SECONDS:
+                return False
+            try:
+                await self._probe_text_embedding_dimension()
+            except EmbeddingProviderUnavailableError:
+                self._last_probe_failure_at = time.monotonic()
+                return False
+        return True
 
     def _validate_text_embedding_dimension(
         self, embedding: list[float]
@@ -583,13 +693,28 @@ class VectorDBOperator:
             "请删除并人工重建向量"
         )
 
+    def _embedding_request_kwargs(self, input: list[str]) -> dict[str, Any]:
+        """构造 embedding 请求参数；仅当探测确认 provider 支持时携带 dimensions。
+
+        部分 provider（如硅基流动的 BAAI/bge-m3）不支持 dimensions 请求字段，
+        但其默认输出维度恰好等于配置维度；无条件携带会导致请求被拒绝。
+        """
+        kwargs: dict[str, Any] = {"input": input, "model": self.emb_model}
+        if self._use_dimensions:
+            kwargs["dimensions"] = self.text_embedding_dimension
+        return kwargs
+
     async def _get_text_embedding(self, text: str) -> list[float] | None:
         """调用 API 获取配置的文本 Dense 向量。"""
         self._raise_if_validation_rejected()
+        if not await self._ensure_embedding_capability_probed():
+            # 能力未决：跳过请求，避免发出不带 dimensions 的请求导致
+            # 默认维度向量触发永久校验拒绝（即使 provider 恢复也无法恢复）。
+            return None
+        self._raise_if_validation_rejected()
         try:
             resp = await self.emb_client.embeddings.create(
-                input=[text],
-                model=self.emb_model
+                **self._embedding_request_kwargs([text]),
             )
             return self._validate_text_embedding_dimension(resp.data[0].embedding)
         except CollectionEmbeddingConfigMismatchError:
@@ -933,6 +1058,11 @@ class VectorDBOperator:
         if not texts:
             return []
         self._raise_if_validation_rejected()
+        if not await self._ensure_embedding_capability_probed():
+            # 能力未决：跳过请求，避免发出不带 dimensions 的请求导致
+            # 默认维度向量触发永久校验拒绝。
+            return []
+        self._raise_if_validation_rejected()
 
         # 硅基流动限制单次 max=64，我们设为 50 以保万无一失
         API_BATCH_LIMIT = 50
@@ -945,8 +1075,7 @@ class VectorDBOperator:
 
                 # 发送分片请求
                 resp = await self.emb_client.embeddings.create(
-                    input=chunk,
-                    model=self.emb_model
+                    **self._embedding_request_kwargs(chunk),
                 )
 
                 # 收集结果

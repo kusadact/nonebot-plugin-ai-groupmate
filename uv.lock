@@ -2124,7 +2124,7 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.1.5"
+version = "2.1.10"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
